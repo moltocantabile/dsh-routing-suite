@@ -1368,8 +1368,7 @@ export function apply(ctx: AppContext, config: Config): void {
                 } catch { /* 枚举失败按未复活处理 */ }
                 if (officialAlive) {
                   logger.info('[super-injector] 自愈：第 %d 次 touch patch 官方重装配生效（%s）', attempt, pkgName)
-                  opStats.selfHeal.ok += 1
-                  saveStats()
+                  recordOp('heal', true)
                   auditLog('heal-ok', `第 ${attempt} 次 touch patch 官方重装配成功（${pkgName}，触发=${reason}）`)
                   try {
                     const cur = readFileSync(patchFile, 'utf8')
@@ -1396,8 +1395,7 @@ export function apply(ctx: AppContext, config: Config): void {
                 }
                 await rebootCtx.loader.create({ name: pkgName, config: cfg })
                 logger.info('[super-injector] 自愈：第 %d 次 fallback loader.create 重新装配完成（%s）', attempt, pkgName)
-                opStats.selfHeal.ok += 1
-                saveStats()
+                recordOp('heal', true)
                 auditLog('heal-ok', `第 ${attempt} 次 fallback loader.create 重新装配成功（${pkgName}，触发=${reason}）`)
                 // fallback create 会制造幽灵 entry——立即仲裁让官方 entry 接管
                 arbitrateOfficial()
@@ -1405,7 +1403,7 @@ export function apply(ctx: AppContext, config: Config): void {
             }
           } catch (e) {
             logger.error('[super-injector] 自愈第 %d 次失败: %s', attempt, String(e))
-            opStats.selfHeal.fail += 1
+            recordOp('heal', false, `第 ${attempt} 次复活自愈未成功: ${String(e)}`.slice(0, 300))
             auditLog(`heal-failed`, `第 ${attempt} 次失败: ${String(e)}（触发=${reason}）`)
             if (attempt < 3) globalThis.setTimeout(heal, 4000)
             else auditLog('heal-exhausted', '3 次均失败（需人工介入：修复产物后 touch profile patch 触发重装配）')
@@ -2525,11 +2523,14 @@ export function apply(ctx: AppContext, config: Config): void {
     } catch { /* 清理失败不阻塞 */ }
   }
 
-  // ═══ 操作自检与统计：每次注入/重载/卸载/安装后验证 client 模块状态并
-  // 记账——操作结果可验证（host ✓ / client ✓），成功率可追溯（准确率）。
-  // ⚠️ 统计持久化 stats.json（跨重启累计）：自重载会重建 fiber（内存清零），
-  // 落盘后历史可追溯——dev_plugin_status 显示的是累计口径。
-  const statsFile = join(dirname(registryFile), 'stats.json')
+  // ═══ 操作自检与统计：每次注入/重载/卸载后验证 client 模块状态并记账
+  // ——操作结果可验证（host ✓ / client ✓），成功率可追溯。
+  // ⚠️ 口径：**只反映本次启动，不落盘**（2026-11-18 用户要求）。此前写
+  // stats.json 跨重启累计，页面上的数字讲的是"这台机器历史上发生过什么"
+  // ——掺着旧版本调试期的失败（5 个空 reason 的 inject ✗），与当前进程状态
+  // 无关、也无法判读；统计的价值在"现在这套产物稳不稳"。
+  // 进程内跨自重载保留（挂 globalThis）：自重载是同一次启动，清零会让
+  // 「27✓/0✗」这类读数失去意义；进程退出即归零。
 
   interface OpStat { ok: number; fail: number }
   interface FailRecord { kind: string; at: string; reason: string }
@@ -2537,45 +2538,40 @@ export function apply(ctx: AppContext, config: Config): void {
     inject: OpStat
     reload: OpStat
     uninject: OpStat
-    install: OpStat
     selfHeal: OpStat
+    heal: OpStat
     lastFailures: FailRecord[]
   }
   const EMPTY_STATS: OpStatsMap = {
     inject: { ok: 0, fail: 0 },
     reload: { ok: 0, fail: 0 },
     uninject: { ok: 0, fail: 0 },
-    install: { ok: 0, fail: 0 },
     selfHeal: { ok: 0, fail: 0 },
+    heal: { ok: 0, fail: 0 },
     lastFailures: [],
   }
 
-  function loadStats(): OpStatsMap {
-    try {
-      const raw = JSON.parse(readFileSync(statsFile, 'utf8')) as OpStatsMap
-      const num = (v: unknown): number => (typeof v === 'number' ? v : 0)
-      const fails = Array.isArray(raw?.lastFailures) ? raw.lastFailures.slice(-5) : []
-      return {
-        inject: { ok: num(raw?.inject?.ok), fail: num(raw?.inject?.fail) },
-        reload: { ok: num(raw?.reload?.ok), fail: num(raw?.reload?.fail) },
-        uninject: { ok: num(raw?.uninject?.ok), fail: num(raw?.uninject?.fail) },
-        install: { ok: num(raw?.install?.ok), fail: num(raw?.install?.fail) },
-        selfHeal: { ok: num(raw?.selfHeal?.ok), fail: num(raw?.selfHeal?.fail) },
-        lastFailures: fails,
-      }
-    } catch {
-      return { ...EMPTY_STATS, inject: { ...EMPTY_STATS.inject }, reload: { ...EMPTY_STATS.reload }, uninject: { ...EMPTY_STATS.uninject }, install: { ...EMPTY_STATS.install }, selfHeal: { ...EMPTY_STATS.selfHeal }, lastFailures: [] }
+  /** 本次启动的统计槽（globalThis 挂载点：自重载换实例不丢，进程退出自然清零）。 */
+  const STATS_SLOT = Symbol.for('dsh-super-injector.opStats')
+
+  function emptyStats(): OpStatsMap {
+    return {
+      inject: { ...EMPTY_STATS.inject },
+      reload: { ...EMPTY_STATS.reload },
+      uninject: { ...EMPTY_STATS.uninject },
+      selfHeal: { ...EMPTY_STATS.selfHeal },
+      heal: { ...EMPTY_STATS.heal },
+      lastFailures: [],
     }
   }
 
-  const opStats: OpStatsMap = loadStats()
-
-  function saveStats(): void {
-    try {
-      mkdirSync(dirname(statsFile), { recursive: true })
-      writeFileSync(statsFile, JSON.stringify(opStats, null, 2), 'utf8')
-    } catch { /* 统计写失败不阻塞 */ }
+  function loadStats(): OpStatsMap {
+    const host = globalThis as unknown as Record<symbol, OpStatsMap | undefined>
+    if (host[STATS_SLOT] === undefined) host[STATS_SLOT] = emptyStats()
+    return host[STATS_SLOT] as OpStatsMap
   }
+
+  const opStats: OpStatsMap = loadStats()
 
   /** 审计摘要：最近 3 条故障/自愈事件（读 self-heal.log 尾部）。 */
   function auditSummary(): string {
@@ -2625,7 +2621,9 @@ export function apply(ctx: AppContext, config: Config): void {
     }
   }
 
-  type OpKind = 'inject' | 'reload' | 'uninject' | 'install' | 'selfHeal'
+  // selfHeal = dev_heal_links 的 junction 重建（✗ = 确实重建过，属正常动作）；
+  // heal = 注入器自身复活自愈（✗ = 没救回来，才需要人工介入）。语义相反，故分桶。
+  type OpKind = 'inject' | 'reload' | 'uninject' | 'selfHeal' | 'heal'
 
   /**
    * 失败归因（可审计）：为什么 hasActiveEntry(name) 是 false。
@@ -2651,7 +2649,7 @@ export function apply(ctx: AppContext, config: Config): void {
     return pkgName + '：' + seen.join(' ; ')
   }
 
-  /** 记录一次操作结果（ok=true 记成功，否则记失败 + 失败原因可审计）；落盘跨重启累计。 */
+  /** 记录一次操作结果（ok=true 记成功，否则记失败 + 失败原因可审计）。仅内存：本次启动口径。 */
   function recordOp(kind: OpKind, ok: boolean, reason?: string): void {
     const bucket = opStats[kind]
     if (ok) bucket.ok += 1
@@ -2659,7 +2657,7 @@ export function apply(ctx: AppContext, config: Config): void {
       bucket.fail += 1
       opStats.lastFailures = [...opStats.lastFailures.slice(-4), { kind, at: new Date().toISOString(), reason: reason ?? '' }]
     }
-    saveStats()
+    // 内存即真相：不落盘（本次启动口径），故此处无需任何持久化动作
   }
 
   /**
@@ -3550,19 +3548,19 @@ export function apply(ctx: AppContext, config: Config): void {
 
   safeRegister(defineTool({
     name: 'dev_plugin_status',
-    description: '列出当下已装配插件清单（id/name/fiber 状态/入口 URL），不执行重载',
+    description: '列出当下已装配插件清单（id/name/fiber 状态/入口 URL）与操作统计，不执行重载。统计只算**本次启动**（内存计数、不落盘、重启归零）：inject/reload/uninject 各为 ✓成功/✗失败，失败条目附归因；selfHeal 是 junction 自愈（✗ = 确实重建过，属正常动作）；heal 是注入器自身复活自愈（✗ = 没救回来，需人工介入）。',
     parameters: {},
     output: {
       schema: { type: 'string' },
       render: (_args: unknown, value: unknown) => [{ type: 'text', text: String(value) }],
     },
     async execute() {
-      const kinds = ['inject', 'reload', 'uninject', 'install', 'selfHeal'] as const
+      const kinds = ['inject', 'reload', 'uninject', 'selfHeal', 'heal'] as const
       const summary = kinds.map((k) => `${k} ${opStats[k].ok}✓/${opStats[k].fail}✗`).join(' | ')
       const failLines = opStats.lastFailures.length
-        ? '\n===== 最近失败（可审计）=====\n' + opStats.lastFailures.map((f) => `[${f.kind} ${f.at}] ${f.reason || '（旧数据：当时未记录原因）'}`).join('\n')
+        ? '\n===== 最近失败（本次启动，可审计）=====\n' + opStats.lastFailures.map((f) => `[${f.kind} ${f.at}] ${f.reason || '（无原因）'}`).join('\n')
         : ''
-      return `===== 操作统计（跨重启累计）=====\n${summary}${failLines}${auditSummary()}\n\n===== 当前已装配插件（loader entries）=====\n` + listPlugins()
+      return `===== 操作统计（本次启动，不落盘）=====\n${summary}${failLines}${auditSummary()}\n\n===== 当前已装配插件（loader entries）=====\n` + listPlugins()
     },
   }))
 

@@ -103,7 +103,7 @@ function SuperInjectorPanel(): JSX.Element {
         const s = d.stats ?? {}
         const fmt = (k: string): string => `${s[k]?.ok ?? 0}✓/${s[k]?.fail ?? 0}✗`
         setStatsText(
-          `共 ${d.entries.length} 个注入插件 · inject ${fmt('inject')} · reload ${fmt('reload')} · uninject ${fmt('uninject')}`,
+          `共 ${d.entries.length} 个注入插件 · 本次启动：inject ${fmt('inject')} · reload ${fmt('reload')} · uninject ${fmt('uninject')}`,
         )
         setEntries(d.entries)
         say('')

@@ -55,6 +55,34 @@ ui-panel 两种形态都通过（ui-panel 的 `lib/client.js` 亦产出）。产
   （安装时/装配时 vs 运行时，含"官方无法删运行时条目"等实测边界）；生态定位表加
   Creator 模式一行；设计原则补第 2 条「不抢官方的活」。
 
+### 变更（操作统计只算本次启动，不再落盘）
+
+- **口径**：`inject / reload / uninject / selfHeal` 原先写
+  `~/.dsh/super-injector/stats.json` **跨重启累计** ⇒ 页面上的数字讲的是"这台机器
+  历史上发生过什么"：掺着旧版本调试期的 5 个 `inject ✗`（当时还不记 reason，全是空
+  字符串），与当前进程状态毫无关系，也无从判读。统计的价值是"现在这套产物稳不稳"，
+  故改为**进程内存计数、不写盘、进程退出即归零**。
+  自重载仍连续累计——那属于同一次启动，载体挂
+  `globalThis[Symbol.for('dsh-super-injector.opStats')]`，否则每次重载清零，
+  「27✓/0✗」这类读数就失去意义了。
+- **自愈一桶拆成两桶**：`selfHeal`（`dev_heal_links` 的 junction 重建，✗ = **做了
+  重建**，正常动作）与 `heal`（注入器自身复活自愈，✗ = **没救回来**，真故障）。
+  原先两件事共用 `selfHeal`，✗ 到底是故障还是正常动作读不出来；且复活自愈三处直接
+  `opStats.selfHeal.ok/fail += 1` 绕过 `recordOp`，失败既不进 `lastFailures`
+  也没有归因——现统一走 `recordOp`（✗ 带第几次尝试与异常）。
+- **删掉 `install` 死计数器**：随 `dev_install_package` 的移除早已无人递增，却常驻
+  显示 `0✓/0✗`（旧数据里还留着一条历史 `1✓`）——从 `OpStatsMap` / `OpKind` /
+  展示清单里一并删掉。
+- **展示口径写明**：`dev_plugin_status` 标题改「操作统计（本次启动，不落盘）」、
+  工具描述列出各桶语义；设置页统计行改成「本次启动：inject … · reload … ·
+  uninject …」，不再让人误读成历史成功率。
+- **回归锁** `tests/stats-per-launch.test.mjs`：src 不许再出现 `statsFile` /
+  `saveStats` / 写 `stats.json` 的通道（`registry.json` 才是该落盘的注入清单）；
+  必须保留 `globalThis` 统计槽；`install` 桶不得复活；`heal` 与 `selfHeal` 不得
+  重新合桶；已构建 lib 与 src 同步。
+- **迁移**：旧的 `~/.dsh/super-injector/stats.json` 直接删掉即可——新版本既不读
+  也不写，留着不会被重新启用。
+
 ### 修复（失败归因：空 reason ⇒ 审计盲区）
 
 - 统计里的 ✗ 一直记不住"为什么"：`recordOp('inject', hostOk)` **从不传 reason**
@@ -65,7 +93,6 @@ ui-panel 两种形态都通过（ui-panel 的 `lib/client.js` 亦产出）。产
     所以给"形态"而非"异常栈"；无同名 entry 则明确指出 loader.create 未产出）；
   - reload 失败 → 抛出信息 / 部分重建的失败列表 / `client ✗` 明细；
   - uninject 失败 → 步骤清单；selfHeal → 实际重建的 junction 清单。
-  （历史记录仍是空 reason，显示改成「旧数据：当时未记录原因」以免被当成 bug。）
   实测：注入一个 `apply` 故意抛错的包 → 记录变成
   `@dsh-external/probe-bad：5b9f651c state=failed`。
 

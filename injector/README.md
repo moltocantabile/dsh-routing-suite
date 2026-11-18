@@ -82,7 +82,7 @@ dsh plugin --profile web add github:yjh051108/dsh-super-injector
 - 🧹 **一键卸载**：`dev_uninject_plugin` fiber 全清理（工具/监听/路由/client 表）→ 清注入清单 → 删 junction，免重启
 - 🛠️ **路由自愈**：`dev_clear_routes` 直捣 webserver 内部路由表，热重载残留的孤儿路由免重启清除
 - 🔁 **重启自动恢复**：注入清单持久化（`~/.dsh/super-injector/registry.json`），web 重启后自动归位
-- 📊 **操作自检**：每次注入/重载/安装返回 `host ✓ / client ✓` 双验证；`dev_plugin_status` 含操作成功率统计
+- 📊 **操作自检**：每次注入/重载返回 `host ✓ / client ✓` 双验证；`dev_plugin_status` 含操作统计——**只算本次启动**（内存计数、不落盘，重启归零）
 - 🛡️ **失败可重试**：`hasActiveEntry` 权威防重 + 失败残留缓存自动清理 + 残留 entry 自动清理
 
 ## 与 DSH 内置 Creator 模式的分工（同一生态内）
@@ -143,7 +143,7 @@ DSH 0.2.1 自带 **Creator 模式**（`cordis` 预置）：`cordis_inspect_*` �
 | `dev_uninject_plugin` | 一键卸载注入模组（fiber dispose 全清理；bundle 插件自动写 disabled 阻断自装配） |
 | `dev_injected_list` | 列出注入清单（官方插件清单没有 provenance，认不出哪些是运行时条目） |
 | `dev_reload_package` | 整包热重载（清缓存 → 重新 import → 重建 fiber，失败回滚保留旧代；含自重载） |
-| `dev_plugin_status` | 已装配插件清单 + `[injected]` 来源标记、fiber 状态、操作成功率统计与后台操作收口 |
+| `dev_plugin_status` | 已装配插件清单 + `[injected]` 来源标记、fiber 状态、本次启动的操作统计（含失败归因）与后台操作收口 |
 | `dev_clear_routes` | webserver 路由残留自愈（按 path 前缀删除孤儿路由） |
 | `dev_heal_links` | profile `link:` 依赖 junction 自愈（悬空/缺失的 node_modules 链接重建） |
 | `dev_fix_patch` | profile patch 去重修复（同 id 保留最后一条 + 备份）——修 `duplicate loader entry id` 启动崩溃 |
@@ -156,6 +156,16 @@ DSH 0.2.1 自带 **Creator 模式**（`cordis` 预置）：`cordis_inspect_*` �
 | `dev_build_plugin` | 生产线：构建打包（依赖源三级回退 → tsdown 自包含 host/client → npm pack） |
 | `dev_release_plugin` | 生产线：`gh release create` 发版（tgz 作附件） |
 | `dev_self_test` | 故障演练：注入→热重载→节流→预检→卸净→patch 合法性 全链路自恢复回归 |
+
+**统计口径**：只计**本次启动**（进程内存，重启归零，**不写盘**）——数字讲的是"当前这套产物稳不稳"，不是这台机器的历史。
+
+| 计数 | ✓ | ✗ |
+|---|---|---|
+| `inject` / `reload` / `uninject` | 操作真的生效（注入看 `hasActiveEntry`，卸载看确实卸掉 entry） | 失败，附归因（同名 entry 的 `state/disabled`、部分重建清单、`client ✗` 明细） |
+| `selfHeal` | `dev_heal_links` 扫过、无需重建 | **做了重建** —— 正常动作，不是故障 |
+| `heal` | 注入器自身复活自愈成功 | **没救回来** —— 这才需要人工介入 |
+
+`uninject` 的"无匹配 entry"是幂等 no-op，既不计 ✓ 也不计 ✗。
 
 **持久安装**请用官方路径：插件页「添加插件」（支持本地目录 / Git / npm / 让 agent 创建），或 CLI `dsh plugin --profile web add <spec>`；注入器的 runtime 通道只管"加载但不写 profile"的使用场景。
 
