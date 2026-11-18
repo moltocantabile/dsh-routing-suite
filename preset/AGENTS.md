@@ -22,73 +22,70 @@
 > 本文档给 agent/开发者：怎么改、怎么验、怎么同步到 DSH、怎么生效。
 > 权威规范（哲学/设计）见 `README.md` 与 `docs/`；演进史见 `CHANGELOG.md`。
 
-## 开发链路全貌
+## 开发链路全貌（DSH 0.2.1+）
 
 ```
-改源码(无版本别名) → selftest 就地验证 → 同步脚本 → 运行目录(版本快照) → dev_reload → DSH 生效
+改源码（preset/<id>/，无版本别名） → selftest 就地验证 → node scripts/build-preset-bundle.mjs
+→ bundles/router-presets/（bundle 包）→ 安装到 profile → 重启 DSH → 新会话生效
 ```
 
-每个预设都是「**源码 = 编辑基准，运行目录 = 版本快照**」：
+DSH 0.2.1 起**预设是 bundle 包**：`$DSH_HOME/.agent-presets/` 目录不再被读取，
+`agent.cordis.yml` 只是构建输入，最终由 `bundles/router-presets/cordis.patch.yml`
+以 `preset-<id>` 声明行（`@deepseek-ai/dsh-agent-preset` + 内联 `config.plugins`）装配。
+兼容细节见 `../docs/COMPAT.md`。
 
-| 预设 | 源码目录(preset/preset/) | 运行目录(~/.dsh/.agent-presets/) | 当前版本 |
+| 预设 | 源码目录 | bundle 内 id | 当前版本 |
 |---|---|---|---|
-| router-standard | `router-standard/` | `router-standard-v22/` | v34 |
-| router-react | `router-react/` | `router-react/` | v17 |
-| router-spec | `router-spec/` | `router-spec/` | v10 |
-
-> ⚠️ **运行目录名只是历史遗留**：`router-standard-v22` 里的 `v22` 是旧目录名，**内容是 v34**（agent.cordis.yml 指 `-v34`）。改名会有风险，勿动目录名。
+| router-standard | `preset/router-standard/` | `preset-router-standard`（order 1） | v34 |
+| router-spec | `preset/router-spec/` | `preset-router-spec`（order 2） | v10 |
+| router-react | `preset/router-react/` | `preset-router-react`（order 3） | v17 |
 
 ## 编辑基准（改哪里）
 
 **改源码目录的无版本别名**，不是带版本号文件：
 
-- `preset/preset/router-standard/router-bootstrap.mjs` ← 主编辑对象
-- `preset/preset/router-standard/router-core.mjs` ← 路由逻辑
-- `preset/preset/router-standard/agent.cordis.yml` ← 装配配置（persona/sections/工具行）
-- 源码里**无版本别名** == 带版本 `-v34.mjs`（一致），无版本别名是纯源，`-v34` 是同步生成的快照。
+- `preset/router-standard/router-bootstrap.mjs` ← 主编辑对象（机制）
+- `preset/router-standard/router-core.mjs` ← 路由逻辑
+- `preset/router-standard/agent.cordis.yml` ← 装配配置（persona/sections/工具行）
 
+> `-v34.mjs` 等带版本文件是当前版快照；无版本别名是纯源，两者需保持一致（生成器会同步进 bundle assets）。
 > 三个文件常联动改：bootstrap（机制）+ core（逻辑）+ agent.cordis.yml（工具面/版本戳）。
 
 ## 验证（改完就地测）
 
 ```bash
-# 源码目录即可验证（selftest 已同步进源码）：
 node preset/router-standard/router-bootstrap-v34.selftest.mjs   # → SELFTEST PASS
-# 或完整测试（依赖 node，来自 Eldwen 用户 nvm）：
-# node --test router.test.mjs   # 单元测试
+cd preset && node --test router.test.mjs router.integration.test.mjs   # 50/50
 ```
 
 ## 同步到 DSH（让改动能跑）
 
 ```bash
-node scripts/sync-preset.cjs router-standard          # 复制 bootstrap/core/agent.cordis/preset/selftest → 运行目录 + 跑 selftest
-node scripts/sync-preset.cjs router-standard --bump   # + 递增 ?v=N（绕 ESM 缓存）
-node scripts/sync-preset.cjs router-react | router-spec
+# 1. 由 preset/*/ 重新生成 bundle（幂等；assets 一并同步）
+node scripts/build-preset-bundle.mjs
+
+# 2. 装/覆盖到 profile（dsh plugin add 会自动把包名加进 dsh.profile.bundles）
+rm -rf ~/.dsh/external/dsh-router-presets
+cp -R bundles/router-presets ~/.dsh/external/dsh-router-presets
+dsh plugin --profile web add ~/.dsh/external/dsh-router-presets
+
+# 3. 重启 DSH（bundle 层在启动时读取；预设行随之重新装配）
+#    验证：dsh --profile web --dump-config | grep preset-router
 ```
 
-- 同步脚本替代 `routing-probe/sync-*-v*.cjs` 那些散落脚本（已废弃）。
-- **`--bump` 在改完 agent.cordis.yml/需要 DSH 加载新代码时用**（递增源码+运行目录双侧 `?v=N`，保持一致）。
-
-## 生效（DSH 加载新代码）
-
-DSH 用 ESM 按 URL 缓存模块，**原地覆盖不生效**，需绕缓存：
-
-```bash
-# 会话里对模型说（注入器提供）：
-dev_reload_preset router-standard    # ?v=N query 变化 → 新会话立即用新代码
-```
-
-> 若 `?v=N` 未变，DSH 内存里还是旧代码。**bump 必须同时改源码 & 运行目录**（脚本 `--bump` 已做）。
+> 改 `preset/*/agent.cordis.yml` 而不重跑生成器 = bundle 陈旧，别忘第 1 步。
+> 生成物可提交（`bundles/` 入库），CI 守卫建议：`node scripts/build-preset-bundle.mjs && git diff --exit-code bundles/`。
 
 ## 关键坑（实测血泪）
 
-1. **`.dsh` 根目录错位**：shell 里 `USERPROFILE/HOME=Administrator`，但 DSH 真实 profile/运行目录在 **`C:\Users\Eldwen`**。
-   同步脚本已显式用 `DSH_HOME || 'C:\\Users\\Eldwen'`，**勿改成走 `USERPROFILE`**（会让你同步到错误路径）。
-2. **ESM 缓存**：改代码必须 `--bump` + `dev_reload_preset`，否则不生效。
-3. **无版本别名 ≠ 历史**：源码的 `router-bootstrap.mjs`/`router-core.mjs` 是**当前版兼容别名**（probe/测试引用），
-   不是历史文件。**勿删、勿移**。真正历史版本在 `docs/archive/`（react v1-8/spec v1）。
-4. **历史版本堆积**：运行目录旧版本文件已在 `_archive_versions/`（v22-v33），源码只存当前版。
-   若再堆积，用 `_archive_versions/` 方式归档而非删除。
+1. **`.agent-presets` 已死**：0.2.1 不读该目录，旧「平铺复制」安装会静默失效（自检还会假绿）。
+2. **persona 配置键**：0.2.1 要求 `prefix:`（旧键 `text:` 挂载即抛 `$.prefix missing required value`）；生成器已改名。
+3. **相对资源名**：插件行 `./x.mjs?v=N` 按 **profile 目录**解析会 404；生成器改成包内 specifier
+   `@dsh-external/dsh-router-presets/assets/<preset>/<file>.mjs`。
+4. **workflow 引擎**：包名 `@deepseek-ai/dsh-workflow-ptc`（`provider: spawn`）；宿主行在 web profile 是 disabled，
+   必须由预设在 delegation isolate 组内提供。
+5. **无版本别名 ≠ 历史**：`router-bootstrap.mjs`/`router-core.mjs` 是当前版兼容别名（probe/测试引用），
+   **勿删、勿移**；历史版本在 `docs/archive/`。
 
 ## 版控边界（.gitignore）
 
@@ -100,11 +97,8 @@ dev_reload_preset router-standard    # ?v=N query 变化 → 新会话立即用�
 ## 工作流速查
 
 ```bash
-# 1. 改编辑基准（无版本别名）
-# 2. 就地验证
-node preset/router-standard/router-bootstrap-v34.selftest.mjs
-# 3. 同步到 DSH（带 bump 绕缓存）
-node scripts/sync-preset.cjs router-standard --bump
-# 4. DSH 会话里 reload
-dev_reload_preset router-standard
+# 1. 改编辑基准（preset/<id>/ 无版本别名）
+# 2. 就地验证（selftest / node --test）
+# 3. 重新生成 bundle：node scripts/build-preset-bundle.mjs
+# 4. 装到 profile（cp 到 ~/.dsh/external + dsh plugin add）+ 重启 DSH
 ```

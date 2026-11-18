@@ -1,5 +1,22 @@
 # Changelog
 
+## v1.27.1 — DSH 0.2.1-rc.2 兼容：预设 bundle 化
+
+**DSH 0.2.1 移除了 `~/.dsh/.agent-presets/` 发现机制**（目录里的 `preset.yml` +
+`agent.cordis.yml` 不再被读取），预设改为普通 bundle 包。本版完成迁移，不改路由行为：
+
+- 新增 `bundles/router-presets/`：`cordis.patch.yml` 插入 `preset-router-standard` /
+  `preset-router-spec` / `preset-router-react` 三行（`@deepseek-ai/dsh-agent-preset`，
+  `config.plugins` = 原 `agent.cordis.yml` 列表），资源随包分发。
+- 修包名：`@deepseek-ai/dsh-workflow-worker-thread` → `@deepseek-ai/dsh-workflow-ptc`
+  （`provider: spawn`）。注意 web profile 里宿主自带的该行是 disabled，预设必须自己提供。
+- 修 persona schema：`text:` → `prefix:`（0.2.1 必填 `prefix`，旧键挂载即抛
+  `$.prefix missing required value`）。
+- 相对资源名（`./router-bootstrap-v34.mjs?v=88`）按 profile 目录解析会 404，
+  改为包内 specifier `@dsh-external/dsh-router-presets/assets/<preset>/<file>.mjs`。
+- 生成器：`scripts/build-preset-bundle.mjs`（从 `preset/*/` 重新生成 patch，幂等）；
+  验证与安装步骤见 `docs/COMPAT.md`。
+
 ## v1.27.0 — 隔离与并行（注意力工程 · 支柱4）
 
 **支柱4 隔离与并行**：当两个独立关注点污染单线程、或一个子问题吞噬主线预算时，用 subagent/workflow

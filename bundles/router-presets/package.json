@@ -1,0 +1,21 @@
+{
+  "name": "@dsh-external/dsh-router-presets",
+  "version": "1.27.0",
+  "private": true,
+  "type": "module",
+  "description": "The three router agent presets (standard/spec/react) as a DSH 0.2.1 bundle: one @deepseek-ai/dsh-agent-preset declaration per preset, with the migrated plugin entries inline and the preset .mjs assets shipped as package resources.",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "exports": {
+    "./assets/*": "./assets/*",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "cordis.patch.yml",
+    "assets"
+  ],
+  "license": "BSD-3-Clause"
+}
