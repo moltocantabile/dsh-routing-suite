@@ -85,11 +85,25 @@ dsh plugin --profile web add github:yjh051108/dsh-super-injector
 - 📊 **操作自检**：每次注入/重载/安装返回 `host ✓ / client ✓` 双验证；`dev_plugin_status` 含操作成功率统计
 - 🛡️ **失败可重试**：`hasActiveEntry` 权威防重 + 失败残留缓存自动清理 + 残留 entry 自动清理
 
+## 与 DSH 内置 Creator 模式的分工（同一生态内）
+
+DSH 0.2.1 自带 **Creator 模式**（`cordis` 预置）：`cordis_inspect_*` 只读探测 + `plugin_manager` 持久装配 + `cordis-plugin-development` 技能。两者**不互相覆盖**，按时间轴分工：
+
+| | Creator 模式（官方） | dsh-super-injector |
+|---|---|---|
+| 时机 | **安装时 / 装配时**：打包成 bundle → `dsh plugin add` → 改配置 → 重装配 | **运行时**：当场注入任意目录、当场卸载、当场重载 |
+| 编辑器循环 | 改源码 → 触发重装配（写 patch / 改 bundles / manager 操作）才生效；`hmr.root` 才能自动 watch | 改代码 → 重建 → **自动 watch ~1.5s 重载**，不碰 profile |
+| 工具面 | 装配期决定（会话内无法改） | `dev_stage_*` 会话内增删工具（后侧挂 → 转正） |
+| 持久性 | 配置即状态，重启仍在 | 默认不持久（清单可 autoRestore，但不是 profile 状态） |
+| 删掉运行时条目 | ❌ 插件清单只读、无 provenance，`set_plugin` 报 `unknown-plugin` | ✅ `dev_uninject_plugin` 直接 dispose |
+
+实测结论（DSH 0.2.1，2026-11-18）：官方通道**没有**运行时注入/卸载/免重装配重载；注入器**不该**重做持久装配（`dev_install_package` 已剪）。持久安装请走官方：插件页「添加插件」（本地目录 / Git / npm / 让 agent 创建）或 CLI `dsh plugin --profile web add <spec>`。
+
 ## 与 dsh-evolve 的定位差异（生态互补）
 
 | | dsh-evolve | dsh-super-injector |
 |---|---|---|
-| 形态 | **创造模式**：agent 现场写单文件插件源码（`~/.dsh/evolve/<name>.mjs`）热挂载 | **手术台**：注入开发者预构建的**完整插件包**（package.json + lib/） |
+| 形态 | **现场写单文件源码**：agent 直接写 `~/.dsh/evolve/<name>.mjs` 热挂载 | **手术台**：注入开发者预构建的**完整插件包**（package.json + lib/） |
 | 适用 | agent 随对话长出小工具（记账/天气/周报） | 装/换成品模组、自主开发闭环（写 → build → 注入 → 热重载） |
 | 联动 | evolve 长出的源码可升级为完整包，再走注入器上膛 | 注入后可被 `dev_reload_package` 热重载 |
 
@@ -105,6 +119,7 @@ dsh plugin --profile web add github:yjh051108/dsh-super-injector
 | 生态入口 | 层 | 一句话分工 |
 |---|---|---|
 | 官方 bundle / repository | 装配层 | 唯一官方入口，配置即状态 |
+| **Creator 模式（内置）** | **官方 authoring + 装配面** | **inspect 探测 + plugin_manager 持久安装/启停 + 插件开发技能** |
 | plugin-registry | 官方薄控制台 | 官方格式插件管理与开发引导 |
 | marisa | agent 面工具链 | 临时插件 → 持久化插件的固化桥 |
 | mygo | 受管对象层 | 插件生命周期对象化（锁定/启停/依赖图） |
@@ -113,7 +128,8 @@ dsh plugin --profile web add github:yjh051108/dsh-super-injector
 
 **设计原则**：
 
-1. **不发明协议**：注入的是标准插件包（package.json + lib/），格式就是官方包格式，装上即官方语义；
+1. **不发明协议**：注入的是标准插件包（package.json + lib/ + `dsh.bundle`），格式就是官方包格式，装上即官方语义；
+2. **不抢官方的活**：持久安装、启停、版本豁免归 `plugin_manager` / 插件页；本插件只做官方留白的运行时面；
 3. **模型可驱动**：dev_* 全是工具，agent 自己注入/卸载/转正——正踩在官方"agent 自己管理运行时"的方向上；
 4. **可逆且自愈**：注入可回滚（失败保旧代）、卸载即净（fiber 全清理）、残留可自愈（路由/缓存/entry 自动清理）。
 
@@ -125,17 +141,23 @@ dsh plugin --profile web add github:yjh051108/dsh-super-injector
 |---|---|
 | `dev_inject_plugin` | 运行时注入本地插件包（junction 链接 + loader.create，`hasActiveEntry` 防重） |
 | `dev_uninject_plugin` | 一键卸载注入模组（fiber dispose 全清理；bundle 插件自动写 disabled 阻断自装配） |
-| `dev_injected_list` | 列出注入清单 |
+| `dev_injected_list` | 列出注入清单（官方插件清单没有 provenance，认不出哪些是运行时条目） |
 | `dev_reload_package` | 整包热重载（清缓存 → 重新 import → 重建 fiber，失败回滚保留旧代；含自重载） |
-| `dev_plugin_status` | 已装配插件清单、fiber 状态与操作成功率统计 |
+| `dev_plugin_status` | 已装配插件清单 + `[injected]` 来源标记、fiber 状态、操作成功率统计与后台操作收口 |
 | `dev_clear_routes` | webserver 路由残留自愈（按 path 前缀删除孤儿路由） |
+| `dev_heal_links` | profile `link:` 依赖 junction 自愈（悬空/缺失的 node_modules 链接重建） |
+| `dev_fix_patch` | profile patch 去重修复（同 id 保留最后一条 + 备份）——修 `duplicate loader entry id` 启动崩溃 |
 | `dev_stage_add` | 开发侧挂：测试工具挂后侧（不进 tools schema，缓存零污染） |
 | `dev_stage_call` | 调用侧挂工具测试 |
 | `dev_stage_list` | 列出侧挂工具（含转正状态） |
 | `dev_stage_promote` | 一键转正：侧挂工具挂前侧正式注册（唯一一次缓存刷新） |
 | `dev_stage_demote` | 撤回/注销侧挂或已转正工具 |
+| `dev_scaffold_plugin` | 生产线：生成四种形态骨架（标准 bundle：package.json + `cordis.patch.yml` + `locale/` + `icon.svg` + tsconfig + build.sh） |
+| `dev_build_plugin` | 生产线：构建打包（依赖源三级回退 → tsdown 自包含 host/client → npm pack） |
+| `dev_release_plugin` | 生产线：`gh release create` 发版（tgz 作附件） |
+| `dev_self_test` | 故障演练：注入→热重载→节流→预检→卸净→patch 合法性 全链路自恢复回归 |
 
-**持久安装**请用官方路径：侧栏「插件 → 添加插件」（支持本地目录 / Git / npm / 让 agent 创建），或 CLI `dsh plugin --profile web add <spec>`；注入器的 runtime 通道只管"加载但不写 profile"的使用场景。
+**持久安装**请用官方路径：插件页「添加插件」（支持本地目录 / Git / npm / 让 agent 创建），或 CLI `dsh plugin --profile web add <spec>`；注入器的 runtime 通道只管"加载但不写 profile"的使用场景。
 
 ## 插件开发指南（生产线）
 
@@ -145,17 +167,23 @@ dsh plugin --profile web add github:yjh051108/dsh-super-injector
 
 ```bash
 # 1. 生成骨架（toolkit / daemon-loop / ui-panel / hybrid）
+#    产物是标准 bundle：package.json（含 dsh.bundle）+ cordis.patch.yml
+#    + locale/en.json + icon.svg + tsconfig + scripts/build.sh + 形态源码
 #    对 AI 说：dev_scaffold_plugin {"dir": "D:/dev/my-plugin", "name": "my-plugin", "form": "daemon-loop", "description": "..."}
 
 # 2. 构建打包（依赖源三级回退：DSH_CHECKOUT → 本地 node_modules → 已安装 dsh；
 #    tsdown 打包 host 为自包含 bundle（+ client）→ npm pack → tgz）
 #    对 AI 说：dev_build_plugin {"dir": "D:/dev/my-plugin"}
 
-# 3. 发布（gh release create v<version> + tgz）
-#    对 AI 说：dev_release_plugin {"dir": "D:/dev/my-plugin", "version": "0.1.0"}
+# 3. 装：两条通道按场景二选一
+#    3a 持久装配（官方通道，重启仍在）
+dsh plugin --profile web add D:/dev/my-plugin
+#    3b 运行时注入（免重启、不写 profile；官方通道装不进的目录也能用）
+#       对 AI 说：dev_inject_plugin {"dir": "D:/dev/my-plugin"}
+#    改代码 → build → 自动 watch ~1.5s 重载（或 dev_reload_package）
 
-# 注入即活：dev_inject_plugin {"dir": "D:/dev/my-plugin"}
-# 改代码 → build → 自动 watch ~1.5s 重载（或 dev_reload_package）
+# 4. 发布（gh release create v<version> + tgz）
+#    对 AI 说：dev_release_plugin {"dir": "D:/dev/my-plugin", "version": "0.1.0"}
 ```
 
 ### 30 行写一个"会思考的插件"（守护循环最小示例）

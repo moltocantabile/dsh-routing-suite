@@ -3,7 +3,8 @@
 > 来源：对 v34（v1.19.1）的一次完整自验（HTML 交付型任务）后的真实感受，
 > 分"建设性/不顺手"两面。**状态：记录待办，未实施**——用户明确"先停下来，不继续改代码"。
 > 每项含：建议 + 我的根因定位（源码级）+ 建议优先级。
-> 待用户点头后按优先级落地；落地后须过 `sync-preset.cjs --bump` + selftest + `dev_reload_preset`。
+> 待用户点头后按优先级落地；落地后须过 `sync-preset.cjs --bump` + selftest + 重新生成 bundle
+> （`node scripts/build-preset-bundle.mjs`）。
 
 ## 一、做得好的（保留，不改进）
 
@@ -76,7 +77,8 @@
 
 ## 四、落地方式（待你点头）
 
-- 全部改动走 **preset 源码（无版本别名）+ `sync-preset.cjs --bump` + selftest + `dev_reload_preset`**。
+- 全部改动走 **preset 源码（无版本别名）+ `sync-preset.cjs --bump` + selftest + 重新生成 bundle 并重装**
+  （0.2.1 起预设是 bundle 包，`.agent-presets/` 已不被读取）。
 - **修复顺序建议**：BUG-1（爆机）→ #1 DOM 精简 → #2 URL 提示 → #5 pageCheckLock 说明 → 其余按你定优先级。
 - 涉及哲学/方向（#6 #8）先与你对齐再动，不擅改。
 

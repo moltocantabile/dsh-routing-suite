@@ -141,29 +141,30 @@ version of that external routing.
 
 ## Usage
 
-**Two presets** (v0.3.0; the router-pro line was retired): install one or more under `~/.dsh/.agent-presets/`:
+**Two presets** (v0.3.0; the router-pro line was retired). DSH 0.2.1+ reads presets as
+**bundle packages**, not as directories under `~/.dsh/.agent-presets/` — that directory
+is no longer read (see `AGENTS.md` and the suite's `README.md`). Install from the
+generated bundle:
 
-```powershell
-# 标准路由预设（RL 接口还原，默认推荐）
-$target = Join-Path $env:USERPROFILE '.dsh\.agent-presets\router-standard'
-Copy-Item -Recurse .\preset\router-standard $target
+```bash
+# 1. regenerate the bundle from preset/*/ (idempotent; assets are synced too)
+node scripts/build-preset-bundle.mjs
 
-# spec 路由预设（深度思考优先）
-$target = Join-Path $env:USERPROFILE '.dsh\.agent-presets\router-spec'
-Copy-Item -Recurse .\preset\router-spec $target
+# 2. install it into the profile (dsh plugin add appends it to dsh.profile.bundles)
+dsh plugin --profile web add ./bundles/router-presets
+
+# 3. restart DSH, open a NEW session, and pick the preset
+#    verify: dsh --profile web --dump-config | grep preset-router
 ```
 
-**免重启安装（推荐）**：装好 [dsh-super-injector](https://github.com/yjh051108/dsh-super-injector)
-后（见套件 `scripts/install-injector.ps1`），改预设代码不再需要换文件名/重启：
-
-```
-dev_reload_preset router-standard   # 预设热更新：?v=N query 绕 ESM 缓存，新会话立即用新代码
-```
+**改预设代码后如何生效**：改 `preset/<id>/` 源码 → selftest → 重新生成 bundle →
+重新 `dsh plugin add` → 重启 DSH → 新会话。预设行由 bundle patch 在启动时装配，
+所以**必须重跑生成器**（只改 `agent.cordis.yml` 不重跑 = bundle 陈旧）。
 
 **注意事项（实测血泪）**：
 
-1. **ESM 缓存**：loader 按 URL 缓存模块——原地覆盖文件内容不生效（改代码必须
-   `dev_reload_preset` 或换文件名）。
+1. **`.agent-presets` 已死**：0.2.1 不读该目录，旧的"平铺复制预设目录"安装方式会
+   静默失效（安装自检还会假绿）。预设以 bundle 包安装，见上。
 2. **首次会话必须新开**：路由模式在首个请求锁定（路径承诺），中途切 GUI 模型/
    改配置不影响已运行会话。
 3. **子代理不路由**：`parentSession` 会话跳过路由层（社区 #5 修复），shell-less
