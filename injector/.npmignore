@@ -1,0 +1,18 @@
+# ── 为什么这个文件必须存在（不是风格问题，是发布件缺文件的问题）──────────────
+# npm 在每个目录里优先用 .npmignore，**只有在它不存在时才用同目录的 .gitignore**。
+# 本包（injector/）是子包，它的 .gitignore 里写着 `lib/`（构建产物不入库）——
+# 于是这个 .gitignore 规则**压过根 package.json 的 files 允许清单**，
+# `npm pack` 打出来的 tarball 里**完全没有 injector/lib**。
+# 而根 package.json 的 main/exports 指向 ./injector/lib/index.js
+# ⇒ 从 git 装（dsh plugin add github:…）的包一启动就 MODULE_NOT_FOUND。
+# 判据：`npm pack --dry-run` 必须列出 injector/lib/index.js（回归测试见
+# test/injector-package-json-shipped.test.mjs）。
+# ⚠️ 因此本文件**绝不能**再写 `lib/`。
+#
+# 注意：.npmignore 一旦存在就完全取代同目录 .gitignore，所以 .gitignore 里
+# 其余想保留的排除项要在这里重复一遍（只重复与发布件相关的那些）。
+node_modules/
+*.tsbuildinfo
+*.tgz
+# 变异测试的临时备份（tests/mutate-to-junction.mjs 生成，不应入库、也不应发布）
+scripts/build.sh.mutation-orig
