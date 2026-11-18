@@ -42,13 +42,21 @@
 不再按预设目录解析 → 404。迁移后资源随 bundle 包分发，行名改为包内 specifier：
 `@dsh-external/dsh-router-presets/assets/<preset>/<file>.mjs`（`?v=` 缓存参数不再需要）。
 
-### 2.5 注入器自身热重载在 0.2.1 上降级（重要）
-0.2.1 的 loader entry **没有 `_dispose`**（`cordis-plugin-loader` 中 0 处出现）。
-注入器的「自重载」路径仍会先 dispose 自身 fiber，再尝试 `_dispose` → 报
-`selfEntry 无官方 _dispose（loader 契约缺失）`，随后走自愈（touch patch / `loader.create`）复活。
-实际影响：**升级注入器代码后，热重载可能只复活旧代**，最稳妥是重启 DSH 一次。
-官方 0.2.1 的替换 API 是 `entry.parent.remove(entry.id, true)`（第二参 `isDispose=true`，返回 `void`），
-上游注入器尚未跟进；`src/index.ts:2166` 还有一处把 `remove()` 当 Promise 用的类型偏差（运行时无害，只影响 `npm run typecheck`）。
+### 2.5 注入器自身热重载在 0.2.1 上改为官方 remove+create（已修复）
+0.2.1 的 loader entry **没有 `_dispose`**（`cordis-plugin-loader` / `dsh-*` lib 中 0 处出现）。
+旧自重载分支会抛 `selfEntry 无官方 _dispose（loader 契约缺失）`，之后靠自愈（touch patch /
+`loader.create`）复活，升级注入器代码后可能只复活旧代。本仓库已补官方替代路径：
+
+1. `entry.parent.remove(entry.id, true)` —— 只 dispose 旧 fiber、保留 options 行（返回 `void`）；
+2. `await oldFiber.dispose()` —— 等旧纤维真正下落，避免新旧工具/服务并存；
+3. **清 `entry.options.disabled`** —— 实测坑：loader 的 `internal/plugin` 监听在纤维卸载时会把
+   `options.disabled = true`；不清就直接 `create` ⇒ `update()` 在 disabled 早退，无 fiber、
+   无报错、apply 不跑（假绿）；
+4. `entry.parent.create(entry.options)` → 验收 fiber 必须 active，否则抛错落 heal。
+
+验证（隔离 `DSH_HOME` + 探针插件）：同 id 重建、fiber 208→242、apply 再执行、entries=1（PASS）。
+非 0.2.1 宿主仍走原 `_dispose` 分支（保持向后兼容）。另 `src/index.ts` 里
+`group.remove()` 当 Promise 用的类型偏差已修（`unknown` + thenable 探测），`npm run typecheck` 干净。
 
 ### 2.6 安装器（install.sh）在 macOS bash 3.2 上崩溃
 macOS 自带 bash 3.2.57：`$target（` 这类「变量紧跟全角括号」会被解析成变量名的一部分，

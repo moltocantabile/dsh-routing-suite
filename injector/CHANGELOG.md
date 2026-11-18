@@ -21,13 +21,24 @@
   `@deepseek-ai/dsh-type-meta@0.0.1-rc.1`，导致 `npm install` 直接失败、prepare 被跳过。
   已重新生成锁文件（`npm install` + 自包含 bundle 验证通过），不再引用该版本。
 
-### 已知（0.2.1 loader 契约）
+### 修复（0.2.1 loader 契约：自重载不再需要重启）
 
-- 0.2.1 的 loader entry **没有 `_dispose`**（`cordis-plugin-loader` 中 0 处）。注入器自重载仍会
-  先 dispose 自身 fiber，再尝试 `_dispose` ⇒ 报 `selfEntry 无官方 _dispose（loader 契约缺失）`，
-  之后由自愈路径（touch patch / `loader.create`）复活。**结论：升级注入器代码后建议重启 DSH。**
-  官方替换 API：`entry.parent.remove(entry.id, true)`（返回 `void`）；`src/index.ts` 里
-  `entry.parent.remove()` 当 Promise 用的类型偏差只影响 `npm run typecheck`，运行时无害。
+- 0.2.1 的 loader entry **没有 `_dispose`**（`cordis-plugin-loader`/`dsh-*` lib 中 0 处），旧自重载
+  分支直接抛 `selfEntry 无官方 _dispose（loader 契约缺失）`，只能靠自愈（touch patch /
+  `loader.create`）复活。现增加官方替代路径（`typeof entry._dispose !== 'function'` 时启用）：
+  - `entry.parent.remove(entry.id, true)` —— 只 dispose 旧 fiber、保留 options 行
+    （`group.remove(id,isDispose)`，返回 `void`，不要再当 Promise 用）
+  - `await oldFiber.dispose()` —— 等旧纤维真正下落，再建新纤维（避免工具/服务重复注册）
+  - **清 `entry.options.disabled`** —— 实测坑：loader 的 `internal/plugin` 监听会在纤维卸载时
+    把 `options.disabled = true`（防幽灵复活）；不清就直接 `create` ⇒ `update()` 在 disabled
+    早退：无 fiber、无报错、apply 不跑（表面成功、实际注入器已死）。
+  - `entry.parent.create(entry.options)` → **验收 fiber 必须 active**，否则抛错落 heal（绝不假绿）。
+- **验证**：隔离 `DSH_HOME` 启动探针插件（`@probe/hot-reload`）实测 remove→dispose→清 disabled→
+  create：同 id 重建、fiber 208→242、apply 再执行一次、entries 仍为 1（PASS）。
+- **顺带修 `npm run typecheck`**：`cleanupStaleEntries` 里把 `group.remove()`（`void`）当 Promise
+  测 truthiness / `.then` 的 3 处报错（TS1345/TS2339）已按 `unknown` + thenable 探测改写，tsc 干净。
+- 仍建议：注入器代码升级后若自重载遇到异常，看 `self-heal.log` 的 `reload-official`/`reload-ok`
+  记录；正常时不再需要重启宿主。
 
 ## [未发布] — 2026-10-15（Desktop 实测：profile 错位 + loader.internal 缺失）
 

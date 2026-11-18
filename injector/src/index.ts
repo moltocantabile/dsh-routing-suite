@@ -1448,10 +1448,47 @@ export function apply(ctx: AppContext, config: Config): void {
             // 是 reboot 上下文的必要适配，且需 _disposing 豁免（entry._dispose
             // 官方计数）与 disabled 兜底清理。
             const entry = selfEntry as any
-            if (!entry || typeof entry._dispose !== 'function') {
-              throw new Error('selfEntry 无官方 _dispose（loader 契约缺失）')
-            }
+            if (!entry) throw new Error('selfEntry 丢失（loader 契约缺失）')
             const rebootCtx = ctx.root as any
+
+            // ═══ DSH 0.2.1+ 官方路径：Entry 不再有私有 _dispose ═══════════════════
+            // 0.2.1 的 cordis-plugin-loader 里 Entry 没有 `_dispose`（grep 0 处），
+            // 官方等价语义是：
+            //   group.remove(id, isDispose=true) → 只 dispose 旧 fiber、保留 options 行
+            //   group.create(options)            → 同一 id 重新 import（代次钩子已 bump）
+            //                                      + registry.plugin 建新 fiber
+            // 不再依赖私有 API；创建交给 loader，client 模块/disabled 归一化等
+            // 监听链路由 loader 自己走完。
+            if (typeof entry._dispose !== 'function') {
+              const parentGroup = entry.parent
+              if (!parentGroup || typeof parentGroup.remove !== 'function' || typeof parentGroup.create !== 'function') {
+                throw new Error('selfEntry 无 _dispose 且 loader 缺 group.remove/create（loader 契约缺失）')
+              }
+              const oldFiber = entry.fiber
+              auditLog('reload-official', `0.2.1 契约：remove+create 重装配（id=${entry.id}）`)
+              parentGroup.remove(entry.id, true)
+              // remove 内部是 fire-and-forget dispose；显式 await 旧 fiber 下落，
+              // 避免新旧 fiber 并存导致工具/服务重复注册（dispose 幂等）。
+              if (oldFiber && typeof oldFiber.dispose === 'function') {
+                try { await oldFiber.dispose() } catch { /* 已卸则忽略 */ }
+              }
+              // ⚠️ 实测踩坑（隔离 boot 探针 @probe/hot-reload，2026-11-18）：loader 的
+              //    `internal/plugin` 监听会在纤维卸载时把 entry.options.disabled 置 true
+              //    （防幽灵复活）。不清掉就直接 create ⇒ update() 在 disabled 早退：
+              //    无 fiber、无报错、apply 不跑 —— 表面 reload-ok 实则注入器已死。
+              //    必须「await 旧 fiber 下落 → 清 disabled → create → 验收 fiber active」。
+              if (entry.options && 'disabled' in entry.options) delete entry.options.disabled
+              const id = await parentGroup.create(entry.options)
+              const recreated = [...rebootCtx.loader.entries()].find(
+                (e: any) => e.options?.id === id && !e.options?.group,
+              ) as any
+              const reState = recreated?.fiber ? FIBER_NAMES[recreated.fiber.state] : 'no-fiber'
+              if (reState !== 'active') throw new Error(`remove+create 后 fiber 未激活（state=${reState}）`)
+              auditLog('reload-ok', `0.2.1 remove+create 重装配成功（id=${id}，fiber=${recreated.fiber.uid}）`)
+              selfReloading = false
+              return
+            }
+
             const previousPlugin = entry.fiber?.runtime?.callback ?? null
             const fresh = rebootCtx.loader.unwrapExports(
               await entry.parent.tree.import(entry.options.name, () => []),
@@ -2162,8 +2199,12 @@ export function apply(ctx: AppContext, config: Config): void {
       const st = entry.fiber ? FIBER_NAMES[entry.fiber.state] : 'no-fiber'
       if (st === 'active') continue
       try {
-        const p = entry.parent.remove(entry.id, true)
-        if (p && typeof p.then === 'function') p.catch(() => { /* 忽略 */ })
+        // loader 契约差异：0.2.1 的 group.remove 返回 void（isDispose=true 只卸 fiber、
+        // 保留 options 行）；旧版/未来版本可能返回 Promise。按 unknown 收，运行时再探测 thenable。
+        const p: unknown = entry.parent.remove(entry.id, true)
+        if (p && typeof (p as { then?: unknown }).then === 'function') {
+          (p as Promise<unknown>).catch(() => { /* 忽略 */ })
+        }
         logger.info('[super-injector] 清理残留 entry %s（%s）', entry.id, st)
       } catch { /* 清理失败不阻塞 */ }
     }
