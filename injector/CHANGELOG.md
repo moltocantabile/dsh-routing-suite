@@ -20,6 +20,11 @@
   官方双参形态 `ctx.slots.register({...}, Component)`，功能不变（列表/加载统计/卸载/
   路径注入/内化/拖放提示/60s 轮询）。验证：ModuleLoader 包装下 bundle 求值 +
   react-dom/server `renderToString` 输出 2319B 有效 HTML（含全部 UI 文案）。
+  > 溯源：上游 1952733 已有同契约修复（`1aa12ad`，DOM useEffect 桥 + label 改
+  > 「插件管理」）；本次 sync 用 injector 仓库旧快照覆盖了 injector/，把该修复
+  > 一并回退成 0.1.x 实例工厂形态——空白页是 sync 回归，不是原设计缺实现。
+  > 现实现保留官方契约与 label「插件管理」，内部为原生 React 元素（非 DOM 桥），
+  > 行为与原设计一一对应。
 - **POSIX symlink 删除（macOS/Linux 硬 bug）**：删 profile 链接 / 链接自愈 / 构建物化 / stripLinks
   处一律 `rmdirSync`。Windows junction 是目录语义可行，POSIX symlink 会 `ENOTDIR` ⇒
   卸载删不掉链接、自愈重建报 `EEXIST`、构建报 `ERR_FS_CP_EINVAL`。改为

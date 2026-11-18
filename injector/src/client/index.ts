@@ -177,7 +177,7 @@ export function apply(ctx: ClientContext): void {
         name: 'settings.section',
         id: 'super-injector-plugins',
         order: 50,
-        label: () => '插件',
+        label: () => '插件管理',
       },
       SuperInjectorPanel,
     ),
