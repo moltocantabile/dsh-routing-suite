@@ -7,6 +7,56 @@
 
 ## [未发布] — 2026-11-18（DSH 0.2.1-rc.2 / macOS 兼容修复）
 
+### 变更（Creator-mode 重审：脚手架产物改成标准 bundle，双通道可装）
+
+- **`dev_scaffold_plugin` 现在发标准 bundle**：此前只写 `dsh.client`、**从不写
+  `dsh.bundle`、也不生成 `cordis.patch.yml`** ⇒ 产物**两条通道都走不通**：官方
+  `dsh plugin add` 把它当普通依赖（CLI 只打一行 warning、entry 永不被装配），
+  `plugin_manager{install_bundle}` 直接 `not-bundle`（`plugin-manager/lib/index.js:2074`），
+  只有注入器能吃下它。现在四种形态统一发 `dsh.bundle.patch` + `cordis.patch.yml`
+  （`- insert:` 一行同名 entry）+ `files` 白名单，一个产物同时支持
+  **持久装配**（`dsh plugin add` / 插件页）与**运行时注入**（`dev_inject_plugin`）。
+- **补展示资源**：新增 `locale/en.json`（`meta.title` / `meta.description`——官方
+  inventory 的标题/描述就来自这里，缺了显示裸模块名）与 `icon.svg`（占位图标，
+  官方要求 SVG/PNG/JPEG/WebP 且 <256 KiB），并在 `exports` 暴露 `./locale/*.json`
+  与 `./icon`。与 Creator 预置技能 `cordis-plugin-development` 的展示清单对齐。
+- **静态引导改写（前缀缓存去冲突）**：`systemPrompt.context` 那段原文把
+  `dev_plugin_status → … → dev_uninject_plugin` 写成"从零体验唯一路径"，与同一
+  前缀里 Creator 技能的"author a bundle → `plugin_manager`"叙事**互相打架**
+  （两条通道叙事 ⇒ 注意力稀释 + 选错通道：持久安装本不需要 build）。现只声明
+  **不可替代的运行时能力**并显式让出持久安装：注入/热重载/卸载/`dev_stage_*`
+  归 dev_*，持久安装/启停/卸载归官方装配层。
+- **工具描述与产物 README 同步**：`dev_scaffold_plugin` description 说明双通道，
+  生成物 README 给出 3a 持久装配 / 3b 运行时注入两条下一步。
+- **回归锁**（`tests/scaffold-bundle.test.mjs`）：① package.json 必发
+  `dsh.bundle.patch`（禁止退回 client-only 分支）；② 必须真写出
+  `cordis.patch.yml` / `locale/en.json` / `icon.svg`；③ `files`/`exports` 覆盖新产物
+  （防 `npm pack` 丢文件）；④ 已构建 `lib/index.js` 必须与 src 同步（陈旧 lib
+  ⇒ 运行中的注入器仍发旧模板）。
+
+### 实测（DSH 0.2.1-rc.2，一次性 `DSH_HOME`，本机 `~/.dsh` 与 3080 未受影响）
+
+`dev_scaffold_plugin` → `dev_build_plugin` → `dsh plugin --profile web add <目录>` →
+`--dump-config` 出现 `- id: scaffold-check-tool2` → 起 `dsh web`：**无
+`did not activate` / `failed to import` / `ERR_MODULE_NOT_FOUND`**。toolkit 与
+ui-panel 两种形态都通过（ui-panel 的 `lib/client.js` 亦产出）。产物 host 为零
+非 `node:` 外部依赖的自包含 bundle——这也是 link: 安装这次不再报裸说明符的原因。
+
+### 文档同步（剪枝遗留的漂移）
+
+- `preset/README.md`：删掉指向已移除工具 `dev_reload_preset` 与 `.agent-presets/`
+  平铺复制的用法段（0.2.1 已不读该目录），改成 bundle 生成 + `dsh plugin add` + 重启
+  的真实链路，"血泪"第 1 条随之更正为「`.agent-presets` 已死」。
+- `preset/docs/FEEDBACK-v34.md`：两处落地清单里的 `dev_reload_preset` 换成
+  「重新生成 bundle 并重装」。
+- `injector/README.md`：工具全家桶表补齐 6 个缺失条目（`dev_heal_links` /
+  `dev_fix_patch` / `dev_scaffold_plugin` / `dev_build_plugin` / `dev_release_plugin` /
+  `dev_self_test`，共 17 个）；新增**「与 DSH 内置 Creator 模式的分工」**小节
+  （安装时/装配时 vs 运行时，含"官方无法删运行时条目"等实测边界）；生态定位表加
+  Creator 模式一行；设计原则补第 2 条「不抢官方的活」。
+
+### 上一轮（同日期）变更保留如下
+
 ### 变更（UI 对齐 DSH 设计体系）
 
 - **设置页面板重写为原生观感**：旧实现用 `--theme-border/--theme-text/--theme-accent`
