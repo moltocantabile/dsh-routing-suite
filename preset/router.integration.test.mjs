@@ -143,7 +143,9 @@ test('phase_begin injects the bootstrap guide exactly once and persists guided (
   const first = await begin.execute()
   assert.match(String(first), /session started/)
   assert.equal(appends.length, 1, 'bootstrap guide appended once')
-  assert.equal(appends[0].source.plugin, 'router-bootstrap')
+  // v4 producer-owned contract (#247): plugin-origin messages carry kind 'plugin:<name>'
+  // and no separate `plugin` field (DSH 0.2.1's session-format v4 rejects the retired literal).
+  assert.equal(appends[0].source.kind, 'plugin:router-bootstrap')
   assert.match(appends[0].content[0].text, /Bootstrap \(once per session\)/)
   const again = await begin.execute()
   assert.match(String(again), /already started/)
