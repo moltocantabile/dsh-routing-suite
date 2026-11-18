@@ -40,7 +40,9 @@ const clientBundle: UserConfig = {
 // '@deepseek-ai/dsh-tools' 会整棵 plugin tree 加载失败（issue #1）——
 // 打包后 lib 零外部依赖，任何装配路径都能加载。
 const hostBundle: UserConfig = {
-  entry: { index: 'src/index.ts' },
+  // index 是插件入口；watch-dangle 是零依赖子模块（tests/dangle.test.mjs 直接 import
+  // 真身，release 形态也必须产出它，否则 npm test 在发布构建上必红）。
+  entry: { index: 'src/index.ts', 'watch-dangle': 'src/watch-dangle.ts' },
   outDir: 'lib',
   format: 'esm',
   platform: 'node',
@@ -51,7 +53,7 @@ const hostBundle: UserConfig = {
     alwaysBundle: (id: string) => !id.startsWith('node:'),
   },
   outputOptions: {
-    entryFileNames: 'index.js',
+    entryFileNames: '[name].js',
   },
 }
 

@@ -40,7 +40,7 @@ const pairs=[['@deepseek-ai/cordis','vendor/cordis'],['cosmokit','vendor/cosmoki
 for(const [name,rel] of pairs){
   const src=path.join(CK,rel), dst=path.join(SRC,'node_modules',...name.split('/'));
   if(!fs.existsSync(src)){ console.log('  MISS src '+src); continue }
-  try{ const st=fs.lstatSync(dst); if(st.isSymbolicLink()) fs.rmdirSync(dst); else fs.rmSync(dst,{recursive:true,force:true}) }catch{}
+  try{ const st=fs.lstatSync(dst); if(st.isSymbolicLink()) { try { fs.unlinkSync(dst) } catch { fs.rmdirSync(dst) } } else fs.rmSync(dst,{recursive:true,force:true}) }catch{}
   fs.mkdirSync(path.dirname(dst),{recursive:true});
   fs.cpSync(src,dst,{recursive:true,dereference:false,filter:(s)=>path.basename(s)!=='node_modules'});
   console.log('  ✓ '+name);

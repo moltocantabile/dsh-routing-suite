@@ -5,6 +5,30 @@
 > **版本以 git tag 为准**：已发布 v0.3.1 / v0.3.3（GitHub Releases 资产）；未打 tag 的
 > 小节为开发史（其内容随下一个发布一并交付）。
 
+## [未发布] — 2026-11-18（DSH 0.2.1-rc.2 / macOS 兼容修复）
+
+> 同步上游 main（v0.3.6 线）后，在 DSH 0.2.1-rc.2 + macOS arm64 上实测定位并修复。
+
+### 修复
+
+- **POSIX symlink 删除（macOS/Linux 硬 bug）**：删 profile 链接 / 链接自愈 / 构建物化 / stripLinks
+  处一律 `rmdirSync`。Windows junction 是目录语义可行，POSIX symlink 会 `ENOTDIR` ⇒
+  卸载删不掉链接、自愈重建报 `EEXIST`、构建报 `ERR_FS_CP_EINVAL`。改为
+  **`unlinkSync` 优先、失败回退 `rmdirSync`**（两者都不递归进目标）。
+- **release 形态 `npm test` 变绿**：`tests/dangle.test.mjs` 依赖 `lib/watch-dangle.js`，
+  而 tsdown 只产出 `lib/index.js`。tsdown 配置增加 `watch-dangle` 入口，发布构建也产出该模块。
+- **锁文件重新生成**：上游 0.3.6 的 `package-lock.json` 钉了公网已 404 的
+  `@deepseek-ai/dsh-type-meta@0.0.1-rc.1`，导致 `npm install` 直接失败、prepare 被跳过。
+  已重新生成锁文件（`npm install` + 自包含 bundle 验证通过），不再引用该版本。
+
+### 已知（0.2.1 loader 契约）
+
+- 0.2.1 的 loader entry **没有 `_dispose`**（`cordis-plugin-loader` 中 0 处）。注入器自重载仍会
+  先 dispose 自身 fiber，再尝试 `_dispose` ⇒ 报 `selfEntry 无官方 _dispose（loader 契约缺失）`，
+  之后由自愈路径（touch patch / `loader.create`）复活。**结论：升级注入器代码后建议重启 DSH。**
+  官方替换 API：`entry.parent.remove(entry.id, true)`（返回 `void`）；`src/index.ts` 里
+  `entry.parent.remove()` 当 Promise 用的类型偏差只影响 `npm run typecheck`，运行时无害。
+
 ## [未发布] — 2026-10-15（Desktop 实测：profile 错位 + loader.internal 缺失）
 
 > 本次三处修复均在 DSH Desktop（profile `desktop`、loader 1.0.5、宿主未开

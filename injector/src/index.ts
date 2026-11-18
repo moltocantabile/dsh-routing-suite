@@ -27,7 +27,7 @@ import type SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import type ToolRegistry from '@deepseek-ai/dsh-tools'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import z from '@deepseek-ai/schemastery'
-import { readdirSync, statSync, readFileSync, writeFileSync, existsSync, mkdirSync, symlinkSync, rmdirSync, appendFileSync, renameSync, lstatSync, rmSync, readlinkSync, realpathSync, copyFileSync } from 'node:fs'
+import { readdirSync, statSync, readFileSync, writeFileSync, existsSync, mkdirSync, symlinkSync, rmdirSync, unlinkSync, appendFileSync, renameSync, lstatSync, rmSync, readlinkSync, realpathSync, copyFileSync } from 'node:fs'
 import { join, relative, dirname, resolve, basename } from 'node:path'
 import { homedir } from 'node:os'
 import { spawnSync } from 'node:child_process'
@@ -93,7 +93,7 @@ use_pkg() {
     // 清掉旧的 dst（可能是历史遗留的 junction —— 同样只用 rmdir，绝不递归进目标）
     try {
       const st = fs.lstatSync(dst);
-      if (st.isSymbolicLink()) fs.rmdirSync(dst);
+      if (st.isSymbolicLink()) { try { fs.unlinkSync(dst) } catch { fs.rmdirSync(dst) } }
       else fs.rmSync(dst, { recursive: true, force: true });
     } catch { /* 不存在则无需删除 */ }
     fs.mkdirSync(path.dirname(dst), { recursive: true });
@@ -2516,7 +2516,7 @@ export function apply(ctx: AppContext, config: Config): void {
       const linkDir = join(profileNodeModules, ...parts)
       try {
         if (existsSync(linkDir)) {
-          rmdirSync(linkDir)
+          removeLinkOnly(linkDir)
           steps.push('junction 已删除: ' + linkDir)
         } else {
           steps.push('（junction 不存在）')
@@ -2552,8 +2552,13 @@ export function apply(ctx: AppContext, config: Config): void {
     let isLink = false
     try { isLink = lstatSync(p).isSymbolicLink() } catch { return }
     if (isLink) {
-      try { rmdirSync(p) } catch {
-        try { rmSync(p, { recursive: false, force: true }) } catch { /* 忽略 */ }
+      // POSIX：symlink 只能用 unlink 删（rmdir 对符号链接是 ENOTDIR）。
+      // Windows：junction 由 lstat 同样报告为 symlink，但 unlink 可能 EPERM，
+      // 故 unlink 失败时回退 rmdir（两者都不会递归进目标）。
+      try { unlinkSync(p) } catch {
+        try { rmdirSync(p) } catch {
+          try { rmSync(p, { recursive: false, force: true }) } catch { /* 忽略 */ }
+        }
       }
       return
     }
@@ -2760,7 +2765,7 @@ export function apply(ctx: AppContext, config: Config): void {
           // （真目录意味着这里有实体内容，删掉是数据损失，宁可跳过让用户排查）。
           try {
             const st = lstatSync(linkPath)
-            if (st.isSymbolicLink()) rmdirSync(linkPath)
+            if (st.isSymbolicLink()) { try { unlinkSync(linkPath) } catch { rmdirSync(linkPath) } }
             else {
               logger.warn('[super-injector] 跳过自愈：%s 是真目录而非链接（不删实体内容）', linkPath)
               continue
@@ -3885,7 +3890,7 @@ export function apply(ctx: AppContext, config: Config): void {
             let isLink = false
             try { isLink = lstatSync(p).isSymbolicLink() } catch { continue }
             if (isLink) {
-              try { rmdirSync(p) } catch { /* 忽略 */ }
+              try { unlinkSync(p) } catch { try { rmdirSync(p) } catch { /* 忽略 */ } }
             }
             else {
               try { if (statSync(p).isDirectory()) stripLinks(p, depth + 1) } catch { /* 忽略 */ }
@@ -3910,7 +3915,7 @@ export function apply(ctx: AppContext, config: Config): void {
         }, null, 2) + '\n', 'utf8')
         writeFileSync(join(tmpDir, 'tsconfig.json'), '{\n  "compilerOptions": {\n    "target": "ES2023", "module": "NodeNext", "moduleResolution": "NodeNext", "lib": ["ES2023"],\n    "strict": true, "types": ["node"], "declaration": true, "declarationDir": "lib/types",\n    "outDir": "lib", "rootDir": "src", "skipLibCheck": true, "esModuleInterop": true,\n    "sourceMap": true\n  },\n  "include": ["src"]\n}\n', 'utf8')
         writeFileSync(join(tmpDir, 'src', 'index.ts'), `import type { Context } from '@deepseek-ai/cordis'\nimport { defineTool } from '@deepseek-ai/dsh-tools'\nexport const name = ${JSON.stringify(TEST_PKG)}\nexport const inject = ['tools']\nexport function apply(ctx: Context): void {\n  ctx.effect(() => ctx.tools.register(defineTool({\n    name: 'self_test_hello',\n    description: 'self test',\n    parameters: {},\n    output: { schema: { type: 'string' }, render: (_a: unknown, v: unknown) => [{ type: 'text', text: String(v) }] },\n    async execute() { return 'hello' },\n  })), 'self-test')\n}\n`, 'utf8')
-        writeFileSync(join(tmpDir, 'scripts', 'build.sh'), `#!/bin/bash\nset -euo pipefail\nROOT="$(cd "$(dirname "$0")/.." && pwd)"\ncd "$ROOT"\nCHECKOUT="\${DSH_CHECKOUT:-}"\nif [ -z "$CHECKOUT" ] || [ ! -d "$CHECKOUT/packages" ]; then echo "no checkout" >&2; exit 1; fi\nTSC="$CHECKOUT/node_modules/.bin/tsc"\n# 依赖物化用 copy，绝不用 junction：本目录是一次性构建目录，整体递归删除时\n# junction 会让 Windows/Node 跟随链接删空**目标**（实测两组 checkout 的同一批\n# link 目标全被掏空）。copy 后源只在读取侧被访问，物理上不可能被写坏。\nuse_pkg() {\n  node -e "const fs=require('fs');const path=require('path');const dst=path.resolve(process.argv[1]);const src=path.resolve(process.argv[2]);try{const st=fs.lstatSync(dst);if(st.isSymbolicLink())fs.rmdirSync(dst);else fs.rmSync(dst,{recursive:true,force:true});}catch{};fs.mkdirSync(path.dirname(dst),{recursive:true});fs.cpSync(src,dst,{recursive:true,dereference:false,filter:(s)=>path.basename(s)!=='node_modules'});" "node_modules/$1" "$2"\n}\nlink_pkg() { use_pkg "$@"; }\nmkdir -p node_modules/@deepseek-ai\nnode -e "const fs=require('fs');try{const s=fs.lstatSync('node_modules/@standard-schema');if(s.isSymbolicLink())fs.rmdirSync('node_modules/@standard-schema');else fs.rmSync('node_modules/@standard-schema',{recursive:true,force:true});}catch{}"\nlink_pkg @deepseek-ai/cordis "$CHECKOUT/vendor/cordis"\nlink_pkg cosmokit "$CHECKOUT/vendor/cosmokit"\nlink_pkg @deepseek-ai/schemastery "$CHECKOUT/vendor/schemastery"\nlink_pkg @deepseek-ai/dsh-tools "$CHECKOUT/packages/core/tools"\nlink_pkg @types/node "$CHECKOUT/node_modules/@types/node"\n"$TSC" -p tsconfig.json\n`, 'utf8')
+        writeFileSync(join(tmpDir, 'scripts', 'build.sh'), `#!/bin/bash\nset -euo pipefail\nROOT="$(cd "$(dirname "$0")/.." && pwd)"\ncd "$ROOT"\nCHECKOUT="\${DSH_CHECKOUT:-}"\nif [ -z "$CHECKOUT" ] || [ ! -d "$CHECKOUT/packages" ]; then echo "no checkout" >&2; exit 1; fi\nTSC="$CHECKOUT/node_modules/.bin/tsc"\n# 依赖物化用 copy，绝不用 junction：本目录是一次性构建目录，整体递归删除时\n# junction 会让 Windows/Node 跟随链接删空**目标**（实测两组 checkout 的同一批\n# link 目标全被掏空）。copy 后源只在读取侧被访问，物理上不可能被写坏。\nuse_pkg() {\n  node -e "const fs=require('fs');const path=require('path');const dst=path.resolve(process.argv[1]);const src=path.resolve(process.argv[2]);try{const st=fs.lstatSync(dst);if(st.isSymbolicLink()){try{fs.unlinkSync(dst)}catch{fs.rmdirSync(dst)}}else fs.rmSync(dst,{recursive:true,force:true});}catch{};fs.mkdirSync(path.dirname(dst),{recursive:true});fs.cpSync(src,dst,{recursive:true,dereference:false,filter:(s)=>path.basename(s)!=='node_modules'});" "node_modules/$1" "$2"\n}\nlink_pkg() { use_pkg "$@"; }\nmkdir -p node_modules/@deepseek-ai\nnode -e "const fs=require('fs');try{const s=fs.lstatSync('node_modules/@standard-schema');if(s.isSymbolicLink()){try{fs.unlinkSync('node_modules/@standard-schema')}catch{fs.rmdirSync('node_modules/@standard-schema')}}else fs.rmSync('node_modules/@standard-schema',{recursive:true,force:true});}catch{}"\nlink_pkg @deepseek-ai/cordis "$CHECKOUT/vendor/cordis"\nlink_pkg cosmokit "$CHECKOUT/vendor/cosmokit"\nlink_pkg @deepseek-ai/schemastery "$CHECKOUT/vendor/schemastery"\nlink_pkg @deepseek-ai/dsh-tools "$CHECKOUT/packages/core/tools"\nlink_pkg @types/node "$CHECKOUT/node_modules/@types/node"\n"$TSC" -p tsconfig.json\n`, 'utf8')
         const checkout = detectCheckout()
         if (!checkout) { check('checkout 探测', false, '无 DSH_CHECKOUT'); return summarize(results) }
         // ── 2. 构建测试插件 ──

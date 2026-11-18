@@ -45,7 +45,7 @@ use_pkg() {
     // 清的只是**本项目内**的 dst；若它是历史遗留 junction，同样只用 rmdir
     try {
       const st = fs.lstatSync(dst);
-      if (st.isSymbolicLink()) fs.rmdirSync(dst);
+      if (st.isSymbolicLink()) { try { fs.unlinkSync(dst) } catch { fs.rmdirSync(dst) } }
       else fs.rmSync(dst, { recursive: true, force: true });
     } catch { /* 不存在则无需删除 */ }
     fs.mkdirSync(path.dirname(dst), { recursive: true });
@@ -91,7 +91,7 @@ node -e "
   const src = path.resolve(process.argv[1]);
   try {
     const st = fs.lstatSync(dst);
-    if (st.isSymbolicLink()) fs.rmdirSync(dst);
+    if (st.isSymbolicLink()) { try { fs.unlinkSync(dst) } catch { fs.rmdirSync(dst) } }
     else fs.rmSync(dst, { recursive: true, force: true });
   } catch { /* 不存在则无需删除 */ }
   fs.mkdirSync(path.dirname(dst), { recursive: true });
@@ -112,7 +112,7 @@ if [ -n "$STD_SCHEMA" ]; then
     const src = path.resolve(process.argv[1]);
     try {
       const st = fs.lstatSync(dst);
-      if (st.isSymbolicLink()) fs.rmdirSync(dst);
+      if (st.isSymbolicLink()) { try { fs.unlinkSync(dst) } catch { fs.rmdirSync(dst) } }
       else fs.rmSync(dst, { recursive: true, force: true });
     } catch { /* 不存在则无需删除 */ }
     fs.mkdirSync(path.dirname(dst), { recursive: true });
