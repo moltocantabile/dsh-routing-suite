@@ -147,7 +147,8 @@ dsh plugin --profile web add github:yjh051108/dsh-super-injector
 # 1. 生成骨架（toolkit / daemon-loop / ui-panel / hybrid）
 #    对 AI 说：dev_scaffold_plugin {"dir": "D:/dev/my-plugin", "name": "my-plugin", "form": "daemon-loop", "description": "..."}
 
-# 2. 构建打包（探测 DSH_CHECKOUT → tsc host → tsdown client（如声明）→ npm pack → tgz）
+# 2. 构建打包（依赖源三级回退：DSH_CHECKOUT → 本地 node_modules → 已安装 dsh；
+#    tsdown 打包 host 为自包含 bundle（+ client）→ npm pack → tgz）
 #    对 AI 说：dev_build_plugin {"dir": "D:/dev/my-plugin"}
 
 # 3. 发布（gh release create v<version> + tgz）

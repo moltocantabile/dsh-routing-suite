@@ -59,7 +59,7 @@ dsh plugin --profile web add ~/dsh-super-injector
 dsh plugin --profile web add github:yjh051108/dsh-super-injector
 ```
 
-重启 web 后同上验证。（git 安装只取源码，需要本机有构建环境：bash + node + npm + DSH checkout 或 `DSH_CHECKOUT` 环境变量。）
+重启 web 后同上验证。（git 安装只取源码，需要本机有构建环境：bash + node + npm；依赖源按 DSH_CHECKOUT → 本地 node_modules → 已安装 dsh 三级回退自动选取。）
 
 ---
 
@@ -171,7 +171,7 @@ dev_self_test         → 一键回归 8 项，期望全部 PASS（含注入/热
 | 装了但 `dev_*` 工具不存在 | 注入器未装配成功。检查：bundle 是否在 `~/.dsh/profiles/web/package.json` 的 `dsh.profile.bundles` 里；web 是否重启过；确认装的是**正在运行的 profile**（`--profile web` 与你的启动 profile 一致） |
 | 装配报 `entry not found` | patch 格式错误（顶层 `- id:` 而不是 `- insert:` 包裹）。参考方式 C 的示例 |
 | YAML 解析报错（两个顶层值） | `cordis.patch.yml` 里同时存在 `[]` 和 `- id:` 条目。清理为单一形式 |
-| `dev_build_plugin` 报 bash/node 找不到 | 需要 bash（Git for Windows/PortableGit）与 node 在 PATH；或设置 `DSH_CHECKOUT` 环境变量指向 dsh 源码 checkout |
+| `dev_build_plugin` 报 bash/node 找不到 | 需要 bash（Git for Windows/PortableGit）与 node 在 PATH。依赖源三级回退（DSH_CHECKOUT → 本地 node_modules → 已安装 dsh）都不可用时才会失败 |
 | GitHub 下载/克隆失败 | 网络问题：换代理/镜像，或改用方式 C 手动装配 |
 | 注入插件报 `client ✗` | 若插件无 client 声明，这是预期（输出会显示"跳过"）；若显示"注册失败"，检查插件 client bundle 是否构建（`npm run build:client`） |
 | 自检的节流/预检显示 `[EXPECTED]` | 这是预期行为（防循环自杀的节流、预检拦截坏代码），计入 PASS，不是故障 |

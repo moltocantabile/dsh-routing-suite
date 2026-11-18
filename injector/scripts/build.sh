@@ -69,6 +69,21 @@ run_tsc() {
 #   3) 结论：只要用 junction，「源目录是否安全」就依赖 Node 未定义行为。故改为
 #      **cpSync 复制** —— 源目录从此只在读取侧被访问，物理上不可能被写坏。
 #      代价：每次构建多复制几 MB（实测 <1s），换依赖永不被掏空，值得。
+# 链接或复制：优先 symlink/junction（快、避免 GB 级复制），失败回退 copy_pkg。
+# 只用于**构建期依赖源**（只读）；清理 dst 时对链接只 unlink，绝不递归进链接目标。
+link_or_copy() {
+  local src="$1" dst="$2"
+  if [ ! -e "$src" ]; then
+    echo "build: dependency target missing: $src" >&2
+    exit 1
+  fi
+  if [ -L "$dst" ]; then rm -f "$dst" || true
+  elif [ -e "$dst" ]; then rm -rf "$dst" 2>/dev/null || true; fi
+  mkdir -p "$(dirname "$dst")"
+  if ln -s "$src" "$dst" 2>/dev/null; then return 0; fi
+  copy_pkg "$src" "$dst"
+}
+
 # 通用物化：$1 = 源绝对路径，$2 = 目标相对路径
 copy_pkg() {
   local src="$1" dst="$2"
@@ -121,15 +136,17 @@ link_pkg() { use_pkg "$@"; }
 
 if [ "$NO_CHECKOUT" = 1 ]; then
   echo "=== Materializing build dependencies (from the installed dsh) ==="
-  if [ ! -d node_modules/@deepseek-ai/dsh-tools ] && [ -n "$DSH_ROOT" ]; then
-    mkdir -p node_modules/@deepseek-ai
-    for pkg in cordis cosmokit schemastery dsh-tools dsh-llm dsh-system-prompt cordis-plugin-loader; do
-      if [ -d "$DSH_ROOT/node_modules/@deepseek-ai/$pkg" ]; then
-        copy_pkg "$DSH_ROOT/node_modules/@deepseek-ai/$pkg" "node_modules/@deepseek-ai/$pkg"
-      fi
-    done
-    if [ -d "$DSH_ROOT/node_modules/@types/node" ]; then
-      copy_pkg "$DSH_ROOT/node_modules/@types/node" "node_modules/@types/node"
+  # ⚠️ 必须是**完整闭包**，不是几个顶层包（2026-11-18 实测）：只放
+  # dsh-tools/cordis/schemastery 时，tsdown 打包遇到 dsh-tools 内部的
+  # @deepseek-ai/dsh-scope、dsh-brand、dsh-sandbox… 解析不到 → 这些说明符被留在
+  # 产物里当 external → 注入时宿主按插件目录解析必然失败（host ✗）。
+  # 已安装 dsh 的 node_modules/@deepseek-ai 就是运行时同版本闭包，整目录接过来即可。
+  if [ -n "$DSH_ROOT" ]; then
+    echo "=== Materializing build dependencies (from the installed dsh) ==="
+    mkdir -p node_modules
+    link_or_copy "$DSH_ROOT/node_modules/@deepseek-ai" "node_modules/@deepseek-ai"
+    if [ -d "$DSH_ROOT/node_modules/@types" ]; then
+      link_or_copy "$DSH_ROOT/node_modules/@types" "node_modules/@types"
     fi
   else
     echo "  using existing node_modules (npm install)"
@@ -199,8 +216,11 @@ else
   fi
 fi
 
-echo "=== Compiling src → lib ==="
-run_tsc -p tsconfig.json
+# 类型检查（advisory；本地回退缺少前端平台类型包，见脚手架模板注释）
+echo "=== Typechecking (tsc --noEmit, advisory) ==="
+if ! run_tsc -p tsconfig.json --noEmit; then
+  echo "build: ⚠️ typecheck 有报错（不阻断构建；完整 checkout 下请修）" >&2
+fi
 
 # ═══════════════════════════════════════════════════════════════════════
 # UI（client bundle）也必须在 build.sh 里构建

@@ -84,6 +84,30 @@
 - **自检不再自带一份 build.sh**：它曾内联一份精简版（只认 DSH_CHECKOUT），与
   脚手架模板双源漂移；现直接复用 `SCAFFOLD_BUILD_SH`。
 
+### 修复（脚手架产物在 0.2.1 上加载不了 —— 闭环断裂）
+
+- **脚手架/构建改为 tsdown 打包 host（不再只留 tsc 产物）**：宿主用 `import()`
+  直接加载插件入口，`@deepseek-ai/*` 是裸说明符、按**插件自身目录**解析；而
+  注入/官方 link 安装的目录里没有 peer 依赖闭包（`dsh-tools` 自己还依赖
+  `dsh-scope`/`dsh-brand`/`dsh-sandbox`…）⇒ tsc 产物加载即 `ERR_MODULE_NOT_FOUND`，
+  实测整条链路 `dev_scaffold_plugin → dev_build_plugin → dev_inject_plugin` 每一步
+  都报 `host ✗`。现改为 tsdown 打包成**自包含 bundle**（`node:` 内置保持 external；
+  UI 仍 CJS + `__ModuleLoader__` 包装、`react` 等 seed 保持外部）。实测：
+  toolkit / ui-panel 两种形态 `host ✓`、`client ✓`。
+- **依赖物化改为完整闭包**：回退路径原只接 7 个顶层包，导致 tsdown 打包时
+  `dsh-scope` 等传递依赖解析不到、被当成 external 留在产物里。现整目录
+  link/copy 已安装 dsh 的 `node_modules/@deepseek-ai`（运行时同版本闭包）；
+  优先 symlink（构建期只读、避免 GB 级复制），无符号链接权限时回退 copy。
+- **typecheck 降级为 advisory**：客户端类型依赖 `react` /
+  `@deepseek-ai/dsh-client-ui-slots` 等**前端 seed 模块**的类型包，本地回退里
+  没有（只有完整源码 checkout 才齐）。类型缺失不再阻断构建（tsdown 打包不需要
+  类型，运行期由宿主 seed 解析），完整 checkout 上仍可 `npm run typecheck`。
+- **自愈 touch 注释不再永久污染 patch**：自愈靠 touch patch 文件触发
+  `include.refresh`，旧实现每次重试都 `appendFileSync('# super-injector heal <ts>')`
+  且从不清理 —— 实测用户 `cordis.patch.yml` 尾部堆了 7 行孤儿注释。现注释为
+  **临时**标记（成功/失败后删除），并在装配时 `purgeHealMarks()` 清扫漏删的
+  （宿主在 3s 验证窗口内被重载时会漏）。
+
 ### 新增（回归锁）
 
 - `tests/client-render.test.mjs`：读**构建产物** `lib/client.js`，在 ModuleLoader 包装下

@@ -99,6 +99,21 @@ run_tsc() {
   fi
 }
 
+# 链接或复制：优先 symlink/junction（快、避免 GB 级复制），失败回退 copy_pkg。
+# 只用于**构建期依赖源**（只读）；清理 dst 时对链接只 unlink，绝不递归进链接目标。
+link_or_copy() {
+  local src="$1" dst="$2"
+  if [ ! -e "$src" ]; then
+    echo "build: dependency target missing: $src" >&2
+    exit 1
+  fi
+  if [ -L "$dst" ]; then rm -f "$dst" || true
+  elif [ -e "$dst" ]; then rm -rf "$dst" 2>/dev/null || true; fi
+  mkdir -p "$(dirname "$dst")"
+  if ln -s "$src" "$dst" 2>/dev/null; then return 0; fi
+  copy_pkg "$src" "$dst"
+}
+
 # 通用物化：$1 = 源绝对路径，$2 = 目标相对路径（copy，绝不用 junction）
 copy_pkg() {
   local src="$1" dst="$2"
@@ -159,17 +174,20 @@ use_pkg() {
 link_pkg() { use_pkg "$@"; }
 
 if [ "$NO_CHECKOUT" = 1 ]; then
-  if [ ! -d node_modules/@deepseek-ai/dsh-tools ] && [ -n "$DSH_ROOT" ]; then
+  # ⚠️ 必须是**完整闭包**，不是几个顶层包（2026-11-18 实测）：只放
+  # dsh-tools/cordis/schemastery 时，tsdown 打包遇到 dsh-tools 内部的
+  # @deepseek-ai/dsh-scope、dsh-brand、dsh-sandbox… 解析不到 → 这些说明符被留在
+  # 产物里当 external → 注入时宿主按插件目录解析必然失败（host ✗）。
+  # 已安装 dsh 的 node_modules/@deepseek-ai 就是运行时同版本闭包，整目录接过来即可。
+  if [ -n "$DSH_ROOT" ]; then
     echo "=== Materializing build dependencies (from the installed dsh) ==="
-    mkdir -p node_modules/@deepseek-ai
-    for pkg in cordis cosmokit schemastery dsh-tools dsh-llm dsh-system-prompt cordis-plugin-loader; do
-      if [ -d "$DSH_ROOT/node_modules/@deepseek-ai/$pkg" ]; then
-        copy_pkg "$DSH_ROOT/node_modules/@deepseek-ai/$pkg" "node_modules/@deepseek-ai/$pkg"
-      fi
-    done
-    if [ -d "$DSH_ROOT/node_modules/@types/node" ]; then
-      copy_pkg "$DSH_ROOT/node_modules/@types/node" "node_modules/@types/node"
+    mkdir -p node_modules
+    link_or_copy "$DSH_ROOT/node_modules/@deepseek-ai" "node_modules/@deepseek-ai"
+    if [ -d "$DSH_ROOT/node_modules/@types" ]; then
+      link_or_copy "$DSH_ROOT/node_modules/@types" "node_modules/@types"
     fi
+  else
+    echo "  using existing node_modules (npm install)"
   fi
 else
   echo "=== Linking build dependencies (checkout: $CHECKOUT) ==="
@@ -196,8 +214,40 @@ else
   fi
 fi
 
-echo "=== Compiling src → lib ==="
-run_tsc -p tsconfig.json
+# 类型检查（不产出：产物由 tsdown 打包，tsc 只做校验）
+# ⚠️ **advisory**：客户端部分依赖 react / @deepseek-ai/dsh-client-ui-slots 的类型，
+# 这些是前端平台的 seed 模块，本地回退（已安装 dsh 的 node_modules）里没有它们的
+# 类型包，只有完整源码 checkout 才齐。类型缺失不该阻断构建——tsdown 打包不需要
+# 类型，运行期由宿主 seed 解析。类型回归请在有完整 checkout 的机器上跑
+# npm run typecheck。故此处失败只告警、不退出。
+echo "=== Typechecking (tsc --noEmit, advisory) ==="
+if ! run_tsc -p tsconfig.json --noEmit; then
+  echo "build: ⚠️ typecheck 有报错（不阻断构建）" >&2
+fi
+
+# ── 打包：host（+ client）→ lib/ ──────────────────────────────────────────
+# ⚠️ 绝不能只留 tsc 产物（2026-11-18 实测）：宿主 import() 插件入口时，裸说明符
+# @deepseek-ai/* 按插件目录解析；注入/官方 link 安装的目录没有 peer 依赖闭包
+# （dsh-tools 自己还依赖 dsh-scope 等）⇒ 加载即 ERR_MODULE_NOT_FOUND，注入报 host ✗。
+# 打包成自包含 bundle 后 lib 零外部依赖，任何装配路径都能加载。
+if [ ! -f tsdown.config.ts ]; then
+  echo "build: ✗ 缺 tsdown.config.ts（host 打包配置）——该文件由 dev_scaffold_plugin 生成" >&2
+  exit 1
+fi
+if [ -f node_modules/.bin/tsdown ]; then
+  node_modules/.bin/tsdown --config tsdown.config.ts
+elif [ -f node_modules/.bin/tsdown.cmd ]; then
+  node_modules/.bin/tsdown.cmd --config tsdown.config.ts
+else
+  echo "  local tsdown not found — fetching via npx (first run only)"
+  npx --yes "tsdown@^0.22.14" --config tsdown.config.ts
+fi
+
+# 判据：声明了 client（dsh.client.platform）就必须产出 lib/client.js
+if grep -q '"platform"' package.json 2>/dev/null && [ ! -f lib/client.js ]; then
+  echo "build: ✗ package.json 声明了 dsh.client，但 lib/client.js 未产出 —— UI 面板将不可用" >&2
+  exit 1
+fi
 echo "=== Build complete ==="
 `
 
@@ -404,7 +454,8 @@ function scaffoldUiSrc(pkgName: string, description: string): string {
   return `/**
  * ${pkgName} — UI 面板形态（由 dev_scaffold_plugin 生成）。
  * host 侧：工具 + webServer API；client 侧：conversation.view slot 面板。
- * 构建：npm run build（host tsc）+ npm run build:client（tsdown → lib/client.js）。
+ * 构建：npm run build（build.sh → tsdown 打包 host + client；host 必须自包含，
+ * 否则裸说明符 @deepseek-ai/* 在注入目录里解析不到 ⇒ host ✗）。
  */
 import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
@@ -507,19 +558,44 @@ export function apply(ctx: ClientContext): void {
 }
 `
 
-/** UI 形态的 tsdown 配置（简化版，参照官方 packages 模式）。 */
-const SCAFFOLD_TSDOWN = (pkgName: string): string => `import { fileURLToPath } from 'node:url'
-import type { UserConfig } from 'tsdown'
+/** tsdown 配置模板：**host 一律打包成自包含 bundle**，带 client 的形态再附一份 client 配置。
+ *
+ * ⚠️ 为什么 host 必须 bundle（2026-11-18 实测闭环）：宿主用 `import()` 直接加载插件
+ * 入口，`@deepseek-ai/*` 是**裸说明符**，按插件自身目录解析。而注入/官方 link 安装
+ * 的插件目录里没有 peer 依赖的完整闭包（dsh-tools 自己还依赖 dsh-scope 等），于是
+ * `tsc` 产出的「保留 import」形态必然 `ERR_MODULE_NOT_FOUND` → 注入报 host ✗。
+ * 打包后 lib/index.js 零外部依赖（node: 内置保持 external），任何装配路径都能加载
+ * —— 注入器自身就是这么打的（tsdown.config.ts 的 hostBundle，同源教训）。
+ */
+const SCAFFOLD_TSDOWN = (pkgName: string, withClient: boolean): string => `import type { UserConfig } from 'tsdown'
 
 const PLUGIN_ID = ${JSON.stringify(pkgName)}
 
+// 宿主自包含打包：@deepseek-ai/* 全部打进 lib/index.js，node: 内置保持 external
+const hostBundle: UserConfig = {
+  entry: { index: 'src/index.ts' },
+  outDir: 'lib',
+  format: 'esm',
+  platform: 'node',
+  dts: false,
+  sourcemap: true,
+  clean: false,
+  deps: {
+    alwaysBundle: (id: string) => !id.startsWith('node:'),
+  },
+  outputOptions: {
+    entryFileNames: '[name].js',
+  },
+}
+${withClient ? `
 const CLIENT_EXTERNALS = [
   'react', 'react/jsx-runtime', 'react-dom', 'react-dom/client',
   '@deepseek-ai/cordis',
   '@deepseek-ai/dsh-client-ui-slots',
-  '@deepseek-ai/dsh-client-runtime/client',
+  '@deepseek-ai/dsh-client-ui-primitives',
 ]
 
+// UI 产物保持 CJS + window.__ModuleLoader__.load 包装（0.2.x 客户端契约）
 const clientBundle: UserConfig = {
   entry: { client: 'src/client/index.ts' },
   outDir: 'lib',
@@ -544,8 +620,11 @@ const clientBundle: UserConfig = {
   },
 }
 
-export default [clientBundle] satisfies UserConfig[]
-`
+export default [hostBundle, clientBundle] satisfies UserConfig[]
+` : `
+export default [hostBundle] satisfies UserConfig[]
+`}`
+
 
 /** 统一 package.json 模板（peerDeps 范围声明，不硬编码版本）。 */
 function scaffoldPackageJson(pkgName: string, description: string, form: string): string {
@@ -573,6 +652,8 @@ function scaffoldPackageJson(pkgName: string, description: string, form: string)
     devDependencies: {
       '@types/node': '^24.13.3',
       typescript: '^5.9.0',
+      // host 打包用（所有形态都打包——见 SCAFFOLD_TSDOWN 处注释）
+      tsdown: '^0.22.14',
     },
     scripts: {
       build: 'bash scripts/build.sh',
@@ -580,8 +661,6 @@ function scaffoldPackageJson(pkgName: string, description: string, form: string)
     },
   }
   if (withClient) {
-    ;(pkg.devDependencies as Record<string, string>)['tsdown'] = '^0.22.14'
-    ;(pkg.scripts as Record<string, string>)['build:client'] = 'tsdown'
     ;(pkg as Record<string, unknown>).exports = {
       '.': { types: './lib/types/index.d.ts', default: './lib/index.js' },
       './client': { types: './lib/types/client/index.d.ts', default: './lib/client.js' },
@@ -1095,6 +1174,33 @@ export function apply(ctx: AppContext, config: Config): void {
     }
   }
 
+  /**
+   * 清理自愈遗留的 touch 注释（`# super-injector heal <ts>`）。
+   *
+   * 自愈靠"touch 一次 patch 文件"触发 include.refresh；touch 打的是临时注释行，
+   * 正常路径验证完就删掉。但宿主在 3s 验证窗口内被重载/重启时，那行就留下了——
+   * 反复自愈后用户 patch 文件尾部堆了一串孤儿注释（实测 7 行）。进程存活时清理是
+   * 数据面兜底：启动/装配时扫一遍，只删自己的标记行，其它内容一律不动。
+   * @returns 删掉的行数
+   */
+  function purgeHealMarks(): number {
+    try {
+      const patchFile = join(dirname(profileNodeModules), 'cordis.patch.yml')
+      if (!existsSync(patchFile)) return 0
+      const before = readFileSync(patchFile, 'utf8')
+      const after = before
+        .split('\n')
+        .filter((line) => !/^# super-injector heal \d+\s*$/.test(line))
+        .join('\n')
+        .replace(/\n{3,}/g, '\n\n')
+      if (after === before) return 0
+      writeFileSync(patchFile, after, 'utf8')
+      return before.split('\n').length - after.split('\n').length
+    } catch {
+      return 0
+    }
+  }
+
   /** 把 patch 内容切分为"条目块"（`- id:` 及其缩进子行 + 前置注释行）。
    * 每块文本保留行尾换行，块间 join 不粘连；顶格注释单独成块（不并入前一条目，
    * 否则重写时注释会与下一条目粘连成一行、后续 `disabled: true` 等错挂条目）。 */
@@ -1182,7 +1288,12 @@ export function apply(ctx: AppContext, config: Config): void {
                     if (existsSync(pkgDir)) auditLog('gen-bump', `heal 前代次 → v${bumpDir(pkgDir)}（${pkgDir}）`)
                   }
                 } catch { /* 代次失败不影响自愈 */ }
-                appendFileSync(patchFile, `\n# super-injector heal ${Date.now()}\n`)
+                // ⚠️ touch 用**临时**注释行，验证完必须删掉（除非确实没写成功）：
+                // 旧实现每次自愈都留一行 `# super-injector heal <ts>`，重试 3 次 +
+                // 反复自愈后 patch 文件尾部堆了一串孤儿注释（实测 7 行），既污染
+                // 用户文件又让 `fix-patch --check` 的输出变噪音。
+                const healMark = `# super-injector heal ${Date.now()}`
+                appendFileSync(patchFile, `\n${healMark}\n`)
                 // 给 include.refresh 一个窗口，然后验证官方 entry 是否复活
                 await new Promise((r) => globalThis.setTimeout(r, 3000))
                 let officialAlive = false
@@ -1200,10 +1311,18 @@ export function apply(ctx: AppContext, config: Config): void {
                   opStats.selfHeal.ok += 1
                   saveStats()
                   auditLog('heal-ok', `第 ${attempt} 次 touch patch 官方重装配成功（${pkgName}，触发=${reason}）`)
+                  try {
+                    const cur = readFileSync(patchFile, 'utf8')
+                    writeFileSync(patchFile, cur.replace(`\n${healMark}\n`, '\n'), 'utf8')
+                  } catch { /* 清理失败不影响自愈结果 */ }
                   // 自愈成功后仲裁：清理可能残留的幽灵 entry（fallback create 曾制造过）
                   arbitrateOfficial()
                   return
                 }
+                try {
+                  const cur = readFileSync(patchFile, 'utf8')
+                  writeFileSync(patchFile, cur.replace(`\n${healMark}\n`, '\n'), 'utf8')
+                } catch { /* 忽略 */ }
                 throw new Error('touch patch 后官方 entry 未复活')
               } catch (e) {
                 // touch 无效 → 降级 loader.create（保底，会留幽灵 entry）
@@ -3114,6 +3233,11 @@ export function apply(ctx: AppContext, config: Config): void {
     } catch { /* 自净失败不阻塞 */ }
   }
   purgeStaleTools()
+  // 自愈 touch 注释的启动清理（见 purgeHealMarks 注释：重载窗口内会漏清理）
+  try {
+    const purged = purgeHealMarks()
+    if (purged > 0) auditLog('purge-heal-marks', `清理 ${purged} 行自愈 touch 注释`)
+  } catch { /* 清理失败不阻塞 */ }
 
   safeRegister(defineTool({
     name: 'dev_inject_plugin',
@@ -3655,7 +3779,7 @@ export function apply(ctx: AppContext, config: Config): void {
 
   safeRegister(defineTool({
     name: 'dev_scaffold_plugin',
-    description: '插件生产线：生成四种形态的插件骨架（toolkit 工具包 / daemon-loop 守护循环(timer+LLM 自主 agent loop) / ui-panel UI 面板 / hybrid 混合）——package.json（peerDeps 范围声明不硬编码版本）+ tsconfig + build.sh（DSH_CHECKOUT 自动探测）+ 形态源码（资源挂 ctx.effect 规范）+ 可选 client 骨架。生成后：dev_build_plugin 构建 → dev_inject_plugin 注入。',
+    description: '插件生产线：生成四种形态的插件骨架（toolkit 工具包 / daemon-loop 守护循环(timer+LLM 自主 agent loop) / ui-panel UI 面板 / hybrid 混合）——package.json（peerDeps 范围声明不硬编码版本）+ tsconfig + build.sh（依赖源三级回退 + tsdown 自包含打包）+ 形态源码（资源挂 ctx.effect 规范）+ 可选 client 骨架。生成后：dev_build_plugin 构建 → dev_inject_plugin 注入。',
     parameters: {
       dir: { type: 'string', required: true, description: '目标目录（绝对路径，不存在则创建）' },
       name: { type: 'string', required: true, description: '插件名（如 my-tool；或完整包名 @scope/my-tool）' },
@@ -3687,6 +3811,10 @@ export function apply(ctx: AppContext, config: Config): void {
           ['scripts/build.sh', SCAFFOLD_BUILD_SH],
           ['README.md', `# ${pkgName}\n\n${args.description ?? pkgName + '（' + form + ' 形态）'}\n\n由 dsh-super-injector dev_scaffold_plugin 生成。\n\n## 构建与注入\n\n\`\`\`bash\nDSH_CHECKOUT=<checkout> bash scripts/build.sh\n# 注入器环境内：dev_inject_plugin <本目录>\n\`\`\`\n`],
         ]
+        const withClient = form === 'ui-panel' || form === 'hybrid'
+        // tsdown 配置**每种形态都有**：host 必须打包成自包含 bundle（否则注入后
+        // 裸说明符 @deepseek-ai/* 解析不到 → host ✗，见 SCAFFOLD_TSDOWN 处注释）。
+        files.push(['tsdown.config.ts', SCAFFOLD_TSDOWN(pkgName, withClient)])
         if (form === 'toolkit') {
           files.push(['src/index.ts', scaffoldToolkitSrc(pkgName, args.description ?? '')])
         } else if (form === 'daemon-loop') {
@@ -3694,12 +3822,10 @@ export function apply(ctx: AppContext, config: Config): void {
         } else if (form === 'ui-panel') {
           files.push(['src/index.ts', scaffoldUiSrc(pkgName, args.description ?? '')])
           files.push(['src/client/index.ts', SCAFFOLD_UI_CLIENT(pkgName)])
-          files.push(['tsdown.config.ts', SCAFFOLD_TSDOWN(pkgName)])
         } else {
           // hybrid：工具 + 守护循环
           files.push(['src/index.ts', scaffoldDaemonSrc(pkgName, args.description ?? '')])
           files.push(['src/client/index.ts', SCAFFOLD_UI_CLIENT(pkgName)])
-          files.push(['tsdown.config.ts', SCAFFOLD_TSDOWN(pkgName)])
         }
         for (const [rel, content] of files) {
           const full = join(targetDir, rel)
@@ -3926,6 +4052,8 @@ export function apply(ctx: { effect: (fn: () => (() => void) | void, label?: str
         // 复用脚手架模板（单一真源）：self-test 曾有自己那份精简 build.sh，只认 DSH_CHECKOUT，
         // 于是没有源码检出的机器上自检第一步就死。模板现已三级回退，这里直接复用。
         writeFileSync(join(tmpDir, 'scripts', 'build.sh'), SCAFFOLD_BUILD_SH, 'utf8')
+        // build.sh 现在强制走 tsdown 打包（host 自包含），自检夹具同样需要配置文件
+        writeFileSync(join(tmpDir, 'tsdown.config.ts'), SCAFFOLD_TSDOWN(TEST_PKG, false), 'utf8')
         // checkout 只是依赖来源之一（build.sh 三级回退：checkout → 本目录
         // node_modules → 已安装的 dsh 本体），缺失**不算失败**，而是记录走了哪条路。
         const checkout = detectCheckout()
