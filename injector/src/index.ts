@@ -2006,7 +2006,7 @@ export function apply(ctx: AppContext, config: Config): void {
           }
         } catch { /* 尽力而为 */ }
         const message = String(e instanceof Error ? (e.stack ?? e.message) : e)
-        recordOp('reload', false)
+        recordOp('reload', false, match + ' 重建抛错（已回滚）: ' + message.slice(0, 300))
         // 强制登记守卫：duplicate route = 旧 fiber 存在「未登记到 ctx.effect 的裸注册」，
         // dispose 无法自动注销 → 新注册撞车。检测到即报错要求登记，并自动清理残留自愈。
         if (message.includes('duplicate') || message.includes('already registered')) {
@@ -2020,7 +2020,9 @@ export function apply(ctx: AppContext, config: Config): void {
       }
 
       if (failures.length) {
-        recordOp('reload', rebuilt > 0)
+        recordOp('reload', rebuilt > 0, rebuilt > 0
+          ? `${match} 部分重建 ${rebuilt}/${fibers.length}: ${failures.join('; ')}`.slice(0, 300)
+          : `${match} 全部 fiber 重建失败: ${failures.join('; ')}`.slice(0, 300))
         return `WARN: ${match} 部分重建（${rebuilt}/${fibers.length}）: ${failures.join('; ')}`
       }
       // 清 disabled（幽灵 entry 隔离）：热重载后 client 模块可重新注册（UI 生效）
@@ -2055,7 +2057,7 @@ export function apply(ctx: AppContext, config: Config): void {
       notifyClientRebuilt(fullName)
       // 自检：完整包名查表（表 key 是完整包名，完全匹配）
       const client = clientStatus(fullName)
-      recordOp('reload', rebuilt > 0)
+      recordOp('reload', rebuilt > 0, client.startsWith('client ✗') ? `${match} | ${client}` : undefined)
       return `OK: ${match} 热重载完成（清缓存 ${urls.length} 模块，重建 ${rebuilt} fiber）\n- ${client}`
     })
   }
@@ -2625,6 +2627,30 @@ export function apply(ctx: AppContext, config: Config): void {
 
   type OpKind = 'inject' | 'reload' | 'uninject' | 'install' | 'selfHeal'
 
+  /**
+   * 失败归因（可审计）：为什么 hasActiveEntry(name) 是 false。
+   * ⚠️ 没这段时 inject 失败记的是空 reason ⇒ 「最近失败」只能显示「（无原因）」，
+   * 5 次失败全靠猜（实际形态是 loader.create 静默不激活 / fiber failed / disabled
+   * 压制 / 同名 group entry）。诊断信息必须与统计同源，事后翻日志翻不出来。
+   */
+  function whyNotActive(pkgName: string): string {
+    const seen: string[] = []
+    for (const entry of ctx.loader.entries()) {
+      const o = entry.options
+      if (o.name !== pkgName) continue
+      const st = entry.fiber ? FIBER_NAMES[entry.fiber.state] : 'no-fiber'
+      const marks = [entry.id + ' state=' + st]
+      if (o.group) marks.push('group')
+      if (entry.disabled) marks.push('entry.disabled')
+      if (o.disabled) marks.push('options.disabled')
+      seen.push(marks.join(' '))
+    }
+    if (seen.length === 0) return pkgName + '：loader 里没有任何同名 entry（loader.create 未产出/已被回收——直接看宿主日志的 plugin 报错行）'
+    // cordis 不把 apply 抛错挂在 fiber 上（只写 logger），故这里给「形态」而非「原因」：
+    // state=failed/no-fiber 且 disabled 才是可判读的部分；异常栈请查宿主输出。
+    return pkgName + '：' + seen.join(' ; ')
+  }
+
   /** 记录一次操作结果（ok=true 记成功，否则记失败 + 失败原因可审计）；落盘跨重启累计。 */
   function recordOp(kind: OpKind, ok: boolean, reason?: string): void {
     const bucket = opStats[kind]
@@ -2747,7 +2773,7 @@ export function apply(ctx: AppContext, config: Config): void {
     }
     const hostOk = hasActiveEntry(pkgName)
     const client = clientStatus(pkgName)
-    recordOp('inject', hostOk)
+    recordOp('inject', hostOk, hostOk ? undefined : whyNotActive(pkgName))
     return `OK: ${pkgName} 已注入（junction=${linkDir}）\n- host ${hostOk ? '✓' : '✗'}\n- ${client}`
   }
 
@@ -2830,7 +2856,7 @@ export function apply(ctx: AppContext, config: Config): void {
     const entryUnloaded = steps.some(s => s.startsWith('entry 已卸载'))
     const noMatch = steps.some(s => s.startsWith('（无匹配 entry）'))
     if (entryUnloaded) recordOp('uninject', true)
-    else if (!noMatch) recordOp('uninject', false)
+    else if (!noMatch) recordOp('uninject', false, steps.join('; ').slice(0, 300))
     return 'OK: 卸载完成\n- ' + steps.join('\n- ')
   }
 
@@ -3451,7 +3477,9 @@ export function apply(ctx: AppContext, config: Config): void {
     },
     async execute() {
       const healed = healProfileLinks()
-      recordOp('selfHeal', healed.length === 0)
+      // 口径（与 uninject 的幂等约定一致）：本次调用做了重建 = 失败（有问题要修），
+      // 无需重建 = 成功。reason 带上重建清单，否则「1✗」事后无从归因。
+      recordOp('selfHeal', healed.length === 0, healed.length ? '重建了 ' + healed.join('; ').slice(0, 300) : undefined)
       return healed.length > 0
         ? `OK: 已重建 ${healed.length} 个 junction\n- ` + healed.join('\n- ')
         : 'OK: 全部 link: 依赖 junction 健康（无需修复）'
@@ -3532,7 +3560,7 @@ export function apply(ctx: AppContext, config: Config): void {
       const kinds = ['inject', 'reload', 'uninject', 'install', 'selfHeal'] as const
       const summary = kinds.map((k) => `${k} ${opStats[k].ok}✓/${opStats[k].fail}✗`).join(' | ')
       const failLines = opStats.lastFailures.length
-        ? '\n===== 最近失败（可审计）=====\n' + opStats.lastFailures.map((f) => `[${f.kind} ${f.at}] ${f.reason || '（无原因）'}`).join('\n')
+        ? '\n===== 最近失败（可审计）=====\n' + opStats.lastFailures.map((f) => `[${f.kind} ${f.at}] ${f.reason || '（旧数据：当时未记录原因）'}`).join('\n')
         : ''
       return `===== 操作统计（跨重启累计）=====\n${summary}${failLines}${auditSummary()}\n\n===== 当前已装配插件（loader entries）=====\n` + listPlugins()
     },

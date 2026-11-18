@@ -55,7 +55,20 @@ ui-panel 两种形态都通过（ui-panel 的 `lib/client.js` 亦产出）。产
   （安装时/装配时 vs 运行时，含"官方无法删运行时条目"等实测边界）；生态定位表加
   Creator 模式一行；设计原则补第 2 条「不抢官方的活」。
 
-### 上一轮（同日期）变更保留如下
+### 修复（失败归因：空 reason ⇒ 审计盲区）
+
+- 统计里的 ✗ 一直记不住"为什么"：`recordOp('inject', hostOk)` **从不传 reason**
+  （reload 的两处失败、uninject、selfHeal 同样），于是「最近失败」只显示
+  「（无原因）」，5 次 inject 失败事后无从判读。现补上归因：
+  - inject 失败 → `whyNotActive(name)`：列出 loader 里同名 entry 的
+    `id / fiber state / disabled`（cordis 不把 apply 抛错挂 fiber，只有 logger，
+    所以给"形态"而非"异常栈"；无同名 entry 则明确指出 loader.create 未产出）；
+  - reload 失败 → 抛出信息 / 部分重建的失败列表 / `client ✗` 明细；
+  - uninject 失败 → 步骤清单；selfHeal → 实际重建的 junction 清单。
+  （历史记录仍是空 reason，显示改成「旧数据：当时未记录原因」以免被当成 bug。）
+  实测：注入一个 `apply` 故意抛错的包 → 记录变成
+  `@dsh-external/probe-bad：5b9f651c state=failed`。
+
 
 ### 变更（UI 对齐 DSH 设计体系）
 
