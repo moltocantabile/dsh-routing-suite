@@ -386,10 +386,19 @@ export function apply(ctx: Context, config: Config): void {
 const SCAFFOLD_UI_CLIENT = (pkgName: string): string => `/**
  * ${pkgName} — client 面板（conversation.view slot）。
  * 构建：npm run build:client（tsdown，产物 lib/client.js，ModuleLoader.load 注册）。
- * ⚠️ 两个必坑（2026-08 实测）：① apply 用 ctx.slots 必须 export const inject
- * = ['slots']（服务注入声明）；② register 必须带 name 字段（= slot 名，
- * 如 conversation.view）——缺 name 报 "slot undefined is not declared"。
+ *
+ * ⚠️ 三个必坑（全部实测）：
+ *  ① apply 用 ctx.slots 必须 \`export const inject = ['slots']\`（服务注入声明）；
+ *  ② register 必须带 name 字段（= slot 名，如 conversation.view）——缺 name 报
+ *    "slot undefined is not declared"；
+ *  ③ **组件必须是 React 组件**（DSH 0.2.x 契约）：shell 用 \`jsx(Comp, props)\`
+ *    挂载，槽位的 component 是**第二个参数**、不是描述符里的字段。旧模板写
+ *    \`component: () => ({ render() {...} })\`（0.1.x 实例工厂）在 0.2.x 上 React
+ *    拿到纯对象 ⇒ 抛 "Objects are not valid as a React child" ⇒ **页面空白**。
+ *    下面用 createElement 写的最小面板即正确形态（也可直接写 .tsx + JSX）。
  */
+import { createElement, useEffect, useState } from 'react'
+import type { JSX } from 'react'
 import type { SlotsService } from '@deepseek-ai/dsh-client-ui-slots'
 
 type ClientContext = {
@@ -398,22 +407,36 @@ type ClientContext = {
 
 export const inject = ['slots']
 
+function Panel(): JSX.Element {
+  const [lines, setLines] = useState<string[] | null>(null)
+  useEffect(() => {
+    fetch('/${pkgName}/api/list')
+      .then((r) => r.json())
+      .then((d: unknown) => setLines(Array.isArray(d) ? d.map(String) : [JSON.stringify(d)]))
+      .catch((err: unknown) => setLines(['加载失败: ' + String(err)]))
+  }, [])
+  return createElement(
+    'div',
+    { style: { padding: '12px', fontSize: '13px' } },
+    createElement('h3', { style: { margin: '0 0 8px' } }, ${JSON.stringify(pkgName)}),
+    lines === null
+      ? createElement('p', { style: { margin: 0 } }, '加载中…')
+      : createElement(
+          'ul',
+          { style: { margin: 0, paddingLeft: '18px' } },
+          ...lines.map((line) => createElement('li', { key: line }, line)),
+        ),
+  )
+}
+
 export function apply(ctx: ClientContext): void {
   ctx.effect(() => ctx.slots.inject('conversation.view', () =>
+    // ⚠️ 组件是 register 的**第二参数**（options, Component），不是 options 字段
     ctx.slots.register({
       name: 'conversation.view',
       id: '${pkgName}-panel',
       label: () => ${JSON.stringify(pkgName)},
-      component: () => ({
-        render() {
-          const el = document.createElement('div')
-          el.textContent = ${JSON.stringify(pkgName)} + ' 面板（host API: /${pkgName}/api）'
-          el.style.padding = '12px'
-          el.style.fontFamily = 'monospace'
-          return el
-        },
-      }),
-    }),
+    }, Panel),
   ), '${pkgName}: panel')
 }
 `
@@ -978,16 +1001,21 @@ export function apply(ctx: AppContext, config: Config): void {
       const appendIds = [...appendText.matchAll(/^\s*- id:\s*([^\s#]+)/gm)].map((m) => m[1])
       // 2. 提取现有内容里所有条目块（含注释），按 id 归组
       const blocks = extractPatchBlocks(content)
-      const existing = new Set<string>()
-      const kept: string[] = []
-      for (const b of blocks) {
-        if (b.id) {
-          // 同 id 重复：只保留最后一条（后续同名覆盖先前的）
-          if (existing.has(b.id)) continue
-          existing.add(b.id)
-        }
-        kept.push(b.text)
+      // 同 id 保留**最后一条**（loader 顺序覆盖语义）：倒序扫描决定保留哪块。
+      // 顶层与嵌套（insert/group 子条目）分开判重——二者同名不算重复。
+      const keep = new Array<boolean>(blocks.length).fill(true)
+      const seenKeys = new Set<string>()
+      for (let i = blocks.length - 1; i >= 0; i--) {
+        const b = blocks[i]
+        if (!b.id) continue // 注释/包裹行：一律保留
+        const key = (b.nested ? 'nested:' : 'top:') + b.id
+        if (seenKeys.has(key)) { keep[i] = false; continue }
+        seenKeys.add(key)
       }
+      const existing = new Set<string>()
+      for (const b of blocks) if (b.id && !b.nested) existing.add(b.id)
+      const kept: string[] = []
+      for (let i = 0; i < blocks.length; i++) if (keep[i]) kept.push(blocks[i].text)
       // 3. 幂等：appendIds 全部已存在 → 不写入
       if (appendIds.length > 0 && appendIds.every((id) => existing.has(id))) {
         return false
@@ -1004,18 +1032,32 @@ export function apply(ctx: AppContext, config: Config): void {
   /** 把 patch 内容切分为"条目块"（`- id:` 及其缩进子行 + 前置注释行）。
    * 每块文本保留行尾换行，块间 join 不粘连；顶格注释单独成块（不并入前一条目，
    * 否则重写时注释会与下一条目粘连成一行、后续 `disabled: true` 等错挂条目）。 */
-  function extractPatchBlocks(content: string): Array<{ id?: string; text: string }> {
+  function extractPatchBlocks(content: string): Array<{ id?: string; nested?: boolean; text: string }> {
     const lines = content.split('\n')
-    const blocks: Array<{ id?: string; text: string }> = []
-    let current: { id?: string; text: string } | null = null
+    const blocks: Array<{ id?: string; nested?: boolean; text: string }> = []
+    let current: { id?: string; nested?: boolean; text: string } | null = null
     for (const line of lines) {
-      const idMatch = /^\s*- id:\s*([^\s#]+)/.exec(line)
-      if (idMatch) {
+      const trimmed = line.trim()
+      if (trimmed === '') {
+        if (current) current.text += line + '\n'
+        continue
+      }
+      // ⚠️ 锚定第 0 列（2026-08-15 实测事故）：旧正则 `/^\s*- id:/` 无锚点，会把
+      // `- insert:` 块里**缩进**的子条目当成顶层条目，与同 id 的顶层 config 块
+      // 判重后把后者删掉——实测吃掉了 web profile 里 dsh-vision 的 baseURL/model，
+      // view_image 回落到错端点报 401。顶层条目只认第 0 列，缩进的按 nested 分桶。
+      const atCol0 = line[0] !== ' ' && line[0] !== '\t'
+      const idMatch = /^-\s+id:\s*([^\s#]+)/.exec(line)
+      if (atCol0 && idMatch) {
         if (current) blocks.push(current)
-        current = { id: idMatch[1], text: line + '\n' }
+        current = { id: idMatch[1], nested: false, text: line + '\n' }
+      } else if (idMatch) {
+        // 缩进的 `- id:`：insert / group 的嵌套子条目，不与顶层条目去重
+        if (current) blocks.push(current)
+        current = { id: idMatch[1], nested: true, text: line + '\n' }
       } else if (current) {
-        if (/^\s/.test(line) || line.trim() === '') {
-          // 条目缩进子行或空行：留在当前块
+        if (/^\s/.test(line)) {
+          // 条目缩进子行：留在当前块
           current.text += line + '\n'
         } else {
           // 顶格注释/杂散行：结束当前块，单独成块保留（防止与下一条目粘连）
@@ -1023,11 +1065,8 @@ export function apply(ctx: AppContext, config: Config): void {
           current = null
           blocks.push({ text: line + '\n' })
         }
-      } else if (line.trim() !== '' && !/^\s*#/.test(line) && !/^\s*\[\]\s*$/.test(line)) {
-        // 非注释、非空、非条目的杂散行：保留原样（如 - insert: 包裹行）
-        blocks.push({ text: line + '\n' })
-      } else if (line.trim() !== '' && !/^\s*\[\]\s*$/.test(line)) {
-        // 顶格注释单独成块
+      } else if (!/^\s*\[\]\s*$/.test(line)) {
+        // 非空、非 `[]` 的顶格行：注释或 `- insert:` 包裹行，单独成块保留
         blocks.push({ text: line + '\n' })
       }
     }

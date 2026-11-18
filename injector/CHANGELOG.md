@@ -43,6 +43,29 @@
   rejection 都降级成日志，等于把致命 bug 静默掉（代码注释里也承认）。`dev_stage_call`
   的**调用窗口内**捕获保留（安全、只影响自身）。
 
+### 修复（合并上游 PR）
+
+- **patch 去重锚定顶层列（上游 #6）**：`scripts/fix-patch.mjs` 与宿主内联
+  `extractPatchBlocks` 的 `- id:` 正则都**没有锚点**，`- insert:` 块里**缩进**的
+  子条目会被当成顶层条目，与同 id 的顶层 config 块判重后把后者删掉——实测事故是
+  web profile 里 dsh-vision 的 baseURL/model 被吃掉，`view_image` 回落到错端点报
+  401。现顶层只认第 0 列，缩进条目按 nested 分桶，二者同名共存。
+  顺带修同族的两个缺陷：①声称"保留最后一条"实际保留第一条（loader 是顺序覆盖
+  语义，必须留最后）②重写一次文件头注释就永久丢失（提取器丢弃顶格注释）。
+- **`dsh plugin` 装出来的包缺 `injector/lib`（上游 #105 不足，本轮补 `.npmignore`）**：
+  嵌套 `injector/.gitignore` 的 `lib/` 会覆盖根 `files` 白名单，`npm pack` 打出
+  10~11 个文件但没有 `lib/`，而根 `main` 指向 `./injector/lib/index.js` ⇒
+  `dsh plugin add github:…` 装上一个加载即炸的包。新增 `injector/.npmignore`
+  （目录级 .npmignore 取代 .gitignore），实测 17 个文件、`injector/lib/index.js`
+  到位，根测试 `test/injector-package-json-shipped.test.mjs` 由红转绿。
+- **脚手架模板产出的面板开箱即空白（上游 #45 同题，本轮重写）**：
+  `dev_scaffold_plugin` 的 ui-panel / hybrid 客户端模板仍在生成
+  `component: () => ({ render() {...} })`（0.1.x 实例工厂）⇒ 在 0.2.x 上 React
+  拿到纯对象 ⇒ 每个脚手架产出的面板都"出生即空白"。模板改为 React 组件 +
+  `ctx.slots.register(descriptor, Panel)` 位置参数，并加了断言锁住（防回潮）。
+- **`scripts/fix-patch.mjs` 忽略 `DSH_HOME`**：它硬写 `~/.dsh/profiles`，隔离
+  测试 / 多实例部署会改错文件。改为 `DSH_HOME || ~/.dsh`（与宿主一致）。
+
 ### 新增（回归锁）
 
 - `tests/client-render.test.mjs`：读**构建产物** `lib/client.js`，在 ModuleLoader 包装下

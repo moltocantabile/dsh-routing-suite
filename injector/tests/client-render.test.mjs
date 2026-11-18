@@ -176,3 +176,18 @@ test('empty registry renders the empty state instead of nothing', async () => {
     delete globalThis.IS_REACT_ACT_ENVIRONMENT
   }
 })
+test('scaffold UI template emits the 0.2.x React contract (not the legacy instance factory)', () => {
+  const source = readFileSync(new URL('../src/index.ts', import.meta.url), 'utf8')
+  const from = source.indexOf('const SCAFFOLD_UI_CLIENT')
+  assert.ok(from !== -1, 'scaffold UI template must exist')
+  const to = source.indexOf('const SCAFFOLD_TSDOWN', from)
+  const template = source.slice(from, to)
+  // 只看模板**代码**，注释里会引用旧写法作为警示，不算违规
+  const code = template.slice(template.indexOf('`')).replace(/\/\*[\s\S]*?\*\//g, '')
+
+  assert.ok(!/component:\s*\(\)\s*=>\s*\(\{/.test(code), 'template must not emit the 0.1.x component: () => ({render()}) form')
+  assert.ok(!/\bcomponent:/.test(code), 'component belongs in the register() second argument, not the descriptor')
+  assert.match(code, /ctx\.slots\.register\(\{[\s\S]*?\}, Panel\)/, 'template must register the component positionally')
+  assert.match(code, /export const inject = \['slots'\]/)
+  assert.match(code, /from 'react'/, 'template must import React hooks')
+})

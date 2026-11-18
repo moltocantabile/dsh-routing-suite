@@ -9,7 +9,7 @@
  *
  * 行为：
  *  1. 扫描所有 profile 的 cordis.patch.yml（或 --profile 指定一个）；
- *  2. 按 entry id 去重（同 id 保留最后一条；注释保留；顶层 [] 清理）；
+ *  2. 按顶层/嵌套条目分桶去重（同 id 保留最后一条；注释保留；顶层 [] 清理）；
  *  3. 修复前自动备份为 cordis.patch.yml.bak-<时间戳>；
  *  4. 输出每处修复（哪个 profile、哪个 id 重复、删了几条）。
  *
@@ -26,45 +26,65 @@ const args = process.argv.slice(2)
 const onlyProfile = args.includes('--profile') ? args[args.indexOf('--profile') + 1] : null
 const checkOnly = args.includes('--check')
 
-/** 切分 patch 内容为条目块（`- id:` 及其子行 + 前置注释），返回块列表与杂散行。 */
+/** 切分 patch 内容为条目块（`- id:` 及其子行 + 前置注释），返回块列表与杂散行。
+ * 顶层条目只认第 0 列的 `- id:`；缩进的 `- id:`（insert 子条目 / group config
+ * 子条目）打 fromInsert 标记，去重时与顶层分桶——旧实现用无锚点正则
+ * `/^\s*- id:/`，会把 insert 块里的子条目当成顶层条目，与同 id 的顶层 config 块
+ * 判重后把后者删掉（2026-08-15 实测事故：dsh-vision 的 baseURL/model 被吃掉）。 */
 function extractBlocks(content) {
   const lines = content.split('\n')
   const blocks = []
   let current = null
   for (const line of lines) {
-    const idMatch = /^\s*- id:\s*([^\s#]+)/.exec(line)
-    if (idMatch) {
+    const trimmed = line.trim()
+    if (trimmed === '') {
+      if (current) current.text += '\n' + line
+      continue
+    }
+    const atCol0 = line[0] !== ' ' && line[0] !== '\t'
+    const idMatch = /^-\s+id:\s*([^\s#]+)/.exec(line)
+    if (atCol0 && idMatch) {
       if (current) blocks.push(current)
-      current = { id: idMatch[1], text: line }
+      current = { id: idMatch[1], fromInsert: false, text: line }
+    } else if (idMatch) {
+      // 缩进 `- id:`：insert / group 的嵌套子条目，去重时与顶层分桶
+      if (current) blocks.push(current)
+      current = { id: idMatch[1], fromInsert: true, text: line }
     } else if (current) {
       current.text += '\n' + line
-    } else if (line.trim() !== '' && !/^\s*#/.test(line) && !/^\s*\[\]\s*$/.test(line)) {
-      blocks.push({ id: undefined, text: line })
+    } else if (!/^\s*\[\]\s*$/.test(line)) {
+      // 顶格注释 / 杂散行：单独成块保留（旧实现丢注释，重写一次文件头就没了）
+      blocks.push({ id: undefined, fromInsert: false, text: line })
     }
   }
   if (current) blocks.push(current)
   return blocks
 }
 
-/** 去重：同 id 保留最后一条；返回 {text, removed:[{id, count}]}。 */
+/** 去重：同 id 保留**最后一条**（loader 顺序覆盖语义），顶层/嵌套分桶；
+ * 返回 {text, removed:[{id, count, scope}]}。 */
 function dedupe(content) {
   const blocks = extractBlocks(content)
   const seen = new Set()
-  const removed = []
-  const kept = []
-  for (const b of blocks) {
-    if (b.id) {
-      if (seen.has(b.id)) {
-        const rec = removed.find((r) => r.id === b.id)
-        if (rec) rec.count += 1
-        else removed.push({ id: b.id, count: 1 })
-        continue
-      }
-      seen.add(b.id)
+  const removedCounts = new Map()
+  const keep = new Array(blocks.length).fill(true)
+  // 倒序遍历：首次遇到的就是"最后一条"，保留它，更早的才算重复
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    const b = blocks[i]
+    if (!b.id) continue
+    const scope = b.fromInsert ? 'nested' : 'top'
+    const key = scope + ':' + b.id
+    if (seen.has(key)) {
+      keep[i] = false
+      const rec = removedCounts.get(key)
+      if (rec) rec.count += 1
+      else removedCounts.set(key, { id: b.id, count: 1, scope })
+      continue
     }
-    kept.push(b.text)
+    seen.add(key)
   }
-  return { text: kept.join('\n'), removed }
+  const kept = blocks.filter((_b, i) => keep[i]).map((b) => b.text)
+  return { text: kept.join('\n'), removed: [...removedCounts.values()] }
 }
 
 function fixFile(patchFile) {
@@ -91,7 +111,8 @@ function fixFile(patchFile) {
 }
 
 function main() {
-  const profilesRoot = join(homedir(), '.dsh', 'profiles')
+  // DSH_HOME 优先（与宿主一致：进程环境变量 > ~/.dsh），否则隔离测试/多实例部署会改错文件
+  const profilesRoot = join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'profiles')
   let profileDirs = []
   try {
     profileDirs = readdirSync(profilesRoot).filter((d) => !d.startsWith('.'))
@@ -122,7 +143,7 @@ function main() {
     }
     fixedAny = true
     for (const rec of r.removed) {
-      console.log(`[${profile}] 修复：id "${rec.id}" 重复，删除 ${rec.count} 条（保留最后一条）`)
+      console.log(`[${profile}] 修复：id "${rec.id}"（${rec.scope}）重复，删除 ${rec.count} 条（保留最后一条）`)
     }
     if (!checkOnly) console.log(`[${profile}] 已重写（原文件备份为 ${patchFile}.bak-<时间戳>）`)
   }
