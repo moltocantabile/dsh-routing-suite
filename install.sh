@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
-# dsh-routing-suite 一键安装（Linux/macOS；镜像 install.ps1）：装配注入器 + 安装预设 + 自检。
+# dsh-routing-suite 一键安装（Linux/macOS；镜像 install.ps1）：装配注入器 + 安装 router presets bundle + 自检。
 # 注入器装配：优先源码构建（npm prepare），失败自动回退官方 Release tgz（SUPER_INJECTOR_VERSION 覆盖版本，默认 0.3.5）。
+# 预设装配：DSH 0.2.1+ 不再读取 ~/.dsh/.agent-presets/，预设以 bundle 包（bundles/router-presets）安装。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # DSH_HOME 优先：部署环境 homedir 可能与 DSH_HOME 不一致，不能只靠 $HOME
 DSH_HOME="${DSH_HOME:-$HOME/.dsh}"
-AGENT_PRESETS_DIR="$DSH_HOME/.agent-presets"
 INJECTOR_DIR="$ROOT/injector"
-PRESET_NAMES=("router-standard" "router-spec")
+PRESET_BUNDLE_DIR="$ROOT/bundles/router-presets"
+PRESET_EXTERNAL_DIR="$DSH_HOME/external/dsh-router-presets"
 
 # 输出着色（非终端自动禁用）
 if [ -t 1 ]; then
@@ -59,7 +60,7 @@ if [ ! -f "$PKG_DIR/lib/index.js" ]; then
           err "Release 包解压后缺少 lib/index.js——包内容异常，请到 https://github.com/yjh051108/dsh-super-injector/releases 核对"
         fi
       else
-        err "Release 下载/解压失败（$SPI_TGZ）——请手动下载 tgz 后重跑本脚本，或改用："
+        err "Release 下载/解压失败（${SPI_TGZ}）——请手动下载 tgz 后重跑本脚本，或改用："
         warn '  B. github: 装配（prepare 钩子自动构建）：dsh plugin --profile web add github:yjh051108/dsh-super-injector'
         warn '  C. 有 DSH 源码 checkout 时：DSH_CHECKOUT=<checkout> bash scripts/build.sh 后再重跑本脚本'
       fi
@@ -102,36 +103,47 @@ else
   warn '未获得可装配的注入器包（lib 缺失）——请按上方提示处理后再重跑本脚本'
 fi
 
-info '[2/4] 安装 router presets'
-mkdir -p "$AGENT_PRESETS_DIR"
-for name in "${PRESET_NAMES[@]}"; do
-  if [ ! -d "$ROOT/preset/$name" ]; then
-    err "仓库缺少预设源码：$ROOT/preset/$name（跳过）"
-    continue
-  fi
-  target="$AGENT_PRESETS_DIR/$name"
-  if [ -d "$target" ]; then
-    warn "预设已存在：$target（如需覆盖请先手动删除）"
-    continue
-  fi
-  # 平铺复制：agent-presets 只扫一级子目录，每个预设目录必须直接含 agent.cordis.yml
-  cp -R "$ROOT/preset/$name" "$target"
-  ok "预设已安装：$target"
-done
-
-info '[3/4] 自检预设布局'
-failed=0
-for name in "${PRESET_NAMES[@]}"; do
-  check="$AGENT_PRESETS_DIR/$name/agent.cordis.yml"
-  if [ -f "$check" ]; then
-    ok "$name -> agent.cordis.yml 就位"
+info '[2/4] 安装 router presets（DSH 0.2.1+ bundle 形态）'
+if [ ! -f "$PRESET_BUNDLE_DIR/cordis.patch.yml" ]; then
+  err "仓库缺少预设 bundle：${PRESET_BUNDLE_DIR}（跳过）"
+else
+  # bundles/router-presets 是生成物：改 preset/*/ 后先跑 node scripts/build-preset-bundle.mjs
+  mkdir -p "$DSH_HOME/external"
+  rm -rf "$PRESET_EXTERNAL_DIR"
+  cp -R "$PRESET_BUNDLE_DIR" "$PRESET_EXTERNAL_DIR"
+  if command -v dsh >/dev/null 2>&1; then
+    dsh plugin --profile web add "$PRESET_EXTERNAL_DIR" && ok '预设 bundle 已装配（重启 DSH 后生效）' || err '预设 bundle 装配失败（见上方输出）'
   else
-    err "$name 缺少 agent.cordis.yml（$check）——预设不会被 DSH 发现"
-    failed=1
+    npx '@deepseek-ai/dsh' plugin --profile web add "$PRESET_EXTERNAL_DIR" && ok '预设 bundle 已装配（重启 DSH 后生效）' || err '预设 bundle 装配失败（见上方输出）'
   fi
-done
+fi
+
+info '[3/4] 自检'
+failed=0
+PRESET_LINK="$DSH_HOME/profiles/web/node_modules/@dsh-external/dsh-router-presets"
+if [ -f "$PRESET_LINK/package.json" ]; then
+  ok "bundle 已链接：$PRESET_LINK"
+else
+  err "bundle 未链接到 profile：$PRESET_LINK"
+  failed=1
+fi
+if command -v dsh >/dev/null 2>&1; then
+  for pid in router-standard router-spec; do
+    if DSH_HOME="$DSH_HOME" dsh --profile web --dump-config 2>/dev/null | grep -q "preset-$pid"; then
+      ok "preset-$pid 已进入装配树"
+    else
+      err "装配树里没有 preset-${pid}——检查 profile package.json 的 dsh.profile.bundles"
+      failed=1
+    fi
+  done
+else
+  warn 'dsh 不在 PATH，跳过 --dump-config 自检'
+fi
+if [ -d "$DSH_HOME/.agent-presets" ]; then
+  warn "检测到遗留目录 $DSH_HOME/.agent-presets：DSH 0.2.1+ 已不再读取，可安全删除"
+fi
 if [ "$failed" -ne 0 ]; then
-  err '预设布局自检失败——请勿复制 preset 整目录（会多套一层），每个预设目录需直接含 agent.cordis.yml'
+  err '自检失败——请看上方提示；兼容说明见 docs/COMPAT.md'
 fi
 
 info '[4/4] 完成'

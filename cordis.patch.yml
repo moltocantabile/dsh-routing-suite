@@ -3,9 +3,10 @@
 # 分发入口：插入 dsh-super-injector 引导器插件行。
 # 引导器是唯一需要官方装配的入口；它注入的超级模组全部走运行时注入（免重启）。
 #
-# 注：router-standard 是 **agent preset**，不是插件 ——
-# 它由 dsh-agent-presets 从 .agent-presets/ 目录加载，不走 bundle 机制。
-# 预设安装见 README / install.ps1。
+# 注：router presets 是 **agent preset**，不是本 bundle 的插件行 ——
+# DSH 0.2.1+ 起预设由 bundles/router-presets 这个独立 bundle 安装
+# （patch 插入 preset-<id> 声明行）；旧 .agent-presets/ 目录已不再读取。
+# 预设安装见 README / install.sh（node scripts/build-preset-bundle.mjs 生成）。
 - insert:
     - id: dsh-super-injector
       name: '@dsh-external/dsh-super-injector'

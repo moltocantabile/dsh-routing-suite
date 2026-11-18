@@ -1,7 +1,12 @@
-﻿# dsh-routing-suite 一键安装（Windows PowerShell）
-# 步骤：1) 装配注入器  2) 安装 router-standard / router-spec 预设  3) 提示重启
+# dsh-routing-suite 一键安装（Windows PowerShell）
+# 步骤：1) 装配注入器  2) 安装 router presets bundle  3) 自检 + 提示重启
+# 注：DSH 0.2.1+ 不再读取 %USERPROFILE%\.dsh\.agent-presets\，预设以 bundle 包安装（bundles/router-presets）。
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
+
+# DSH_HOME 优先：部署环境 USERPROFILE 可能与 DSH_HOME 不一致
+$dshHome = if ($env:DSH_HOME) { $env:DSH_HOME } else { Join-Path $env:USERPROFILE '.dsh' }
+$profileDir = Join-Path $dshHome 'profiles\web'
 
 Write-Host '=== [1/3] 装配注入器 ===' -ForegroundColor Cyan
 $injector = Join-Path $root 'injector'
@@ -36,33 +41,43 @@ if (Test-Path (Join-Path $injector 'lib\index.js')) {
   Write-Host '注入器已装配（重启后由 bundles 接管）' -ForegroundColor Green
 }
 
-Write-Host '=== [2/3] 安装 router presets ===' -ForegroundColor Cyan
-$presetRoot = Join-Path $root 'preset'
-$presets = @('router-standard', 'router-spec')
-foreach ($name in $presets) {
-  $target = Join-Path $env:USERPROFILE (Join-Path '.dsh\.agent-presets' $name)
-  if (Test-Path $target) {
-    Write-Host "预设已存在：$target（如需覆盖请先手动删除）" -ForegroundColor Yellow
-    continue
-  }
-  New-Item -ItemType Directory -Force -Path (Split-Path $target) | Out-Null
-  # 平铺复制：DSH 的 agent-presets 发现只扫一级子目录，每个预设目录必须直接含 agent.cordis.yml
-  Copy-Item -Recurse (Join-Path $presetRoot $name) $target
-  Write-Host "预设已安装：$target" -ForegroundColor Green
-}
-
-# 自检：两个预设一级目录必须直接含 agent.cordis.yml（防嵌套层级错误）
-Write-Host '=== 自检预设布局 ===' -ForegroundColor Cyan
-foreach ($name in $presets) {
-  $check = Join-Path $env:USERPROFILE (Join-Path '.dsh\.agent-presets' (Join-Path $name 'agent.cordis.yml'))
-  if (Test-Path $check) {
-    Write-Host "OK: $name -> agent.cordis.yml 就位" -ForegroundColor Green
+Write-Host '=== [2/3] 安装 router presets（bundle 形态） ===' -ForegroundColor Cyan
+$presetBundle = Join-Path $root 'bundles\router-presets'
+$presetExternal = Join-Path $dshHome 'external\dsh-router-presets'
+if (-not (Test-Path (Join-Path $presetBundle 'cordis.patch.yml'))) {
+  Write-Host "仓库缺少预设 bundle：$presetBundle（跳过）" -ForegroundColor Red
+} else {
+  $externalRoot = Split-Path -Parent $presetExternal
+  New-Item -ItemType Directory -Force -Path $externalRoot | Out-Null
+  if (Test-Path $presetExternal) { Remove-Item -Recurse -Force $presetExternal }
+  Copy-Item -Recurse $presetBundle $presetExternal
+  $dshCmd = Get-Command dsh -ErrorAction SilentlyContinue
+  if ($dshCmd) {
+    & dsh plugin --profile web add $presetExternal 2>&1 | Out-Host
   } else {
-    Write-Host "FAIL: $name 缺少 agent.cordis.yml（$check）——预设不会被 DSH 发现" -ForegroundColor Red
+    & npx '@deepseek-ai/dsh' plugin --profile web add $presetExternal 2>&1 | Out-Host
   }
+  Write-Host '预设 bundle 已装配（重启 DSH 后生效）' -ForegroundColor Green
 }
 
-Write-Host '=== [3/3] 完成 ===' -ForegroundColor Cyan
+Write-Host '=== [3/3] 自检 ===' -ForegroundColor Cyan
+$failed = $false
+$presetLink = Join-Path $profileDir 'node_modules\@dsh-external\dsh-router-presets\package.json'
+if (Test-Path $presetLink) {
+  Write-Host "OK: bundle 已链接 -> $presetLink" -ForegroundColor Green
+} else {
+  Write-Host "FAIL: bundle 未链接到 profile（$presetLink）" -ForegroundColor Red
+  $failed = $true
+}
+$legacy = Join-Path $dshHome '.agent-presets'
+if (Test-Path $legacy) {
+  Write-Host "! 检测到遗留目录 $legacy：DSH 0.2.1+ 已不再读取，可安全删除" -ForegroundColor Yellow
+}
+if ($failed) {
+  Write-Host '自检失败——请看上方提示；兼容说明见 docs/COMPAT.md' -ForegroundColor Red
+}
+
+Write-Host '=== 完成 ===' -ForegroundColor Cyan
 Write-Host '1. 重启 DSH（web 服务）' -ForegroundColor Yellow
 Write-Host '2. GUI 新建会话 → 选择 Router Standard / Router Spec (experimental)' -ForegroundColor Yellow
 Write-Host '3. 发任务：生成任务自动 react，维护任务自动 spec，模糊任务进 weak 内路由' -ForegroundColor Yellow
