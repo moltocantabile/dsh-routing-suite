@@ -66,6 +66,24 @@
 - **`scripts/fix-patch.mjs` 忽略 `DSH_HOME`**：它硬写 `~/.dsh/profiles`，隔离
   测试 / 多实例部署会改错文件。改为 `DSH_HOME || ~/.dsh`（与宿主一致）。
 
+### 修复（无 DSH 源码检出的机器上产线全断）
+
+- **构建依赖三级回退**：`build.sh` 原本硬性要求 `DSH_CHECKOUT`（源码检出），
+  本机只有 npm 全局安装的 dsh ⇒ `dev_build_plugin` / `dev_self_test` 第一步就死，
+  脚手架产线整体不可用。现按 ① DSH_CHECKOUT 源码检出 ② 本目录 `npm install`
+  过的 node_modules ③ **已安装的 dsh 本体**（自带全部 `@deepseek-ai/*` 与
+  `@types/node`，且与运行时同版本）依次回退；tsc 缺失时用 `npx -p typescript`
+  拉（与既有 tsdown 回退同一策略）。`scripts/build.sh` 与脚手架内嵌模板同步改，
+  `dev_build_plugin` 不再在 checkout 缺失时直接拒绝。
+- **自检测试插件改为零依赖**：原测试插件 `import { defineTool } from
+  '@deepseek-ai/dsh-tools'`，而宿主用 `import()` 直接加载插件入口、裸说明符按
+  插件目录解析 ⇒ 注入的临时目录里没有完整依赖闭包（连带 `dsh-scope`）⇒
+  在 0.2.1 上必然 `ERR_MODULE_NOT_FOUND`，自检把「注入」判 FAIL。自检要证的是
+  注入/重载/卸载链路，不是工具注册，故入口只导出 `name`/`apply`、零 import；
+  工具注册路径由 `dev_stage_*` 覆盖。自检从 0/1（checkout 门）→ **9/9 PASS**。
+- **自检不再自带一份 build.sh**：它曾内联一份精简版（只认 DSH_CHECKOUT），与
+  脚手架模板双源漂移；现直接复用 `SCAFFOLD_BUILD_SH`。
+
 ### 新增（回归锁）
 
 - `tests/client-render.test.mjs`：读**构建产物** `lib/client.js`，在 ModuleLoader 包装下

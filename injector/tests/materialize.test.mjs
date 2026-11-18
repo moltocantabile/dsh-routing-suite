@@ -37,10 +37,20 @@ import { execFileSync } from 'node:child_process'
 const ROOT = path.resolve(import.meta.dirname, '..')
 const BUILD_SH = fs.readFileSync(path.join(ROOT, 'scripts/build.sh'), 'utf8')
 
-/** 从 scripts/build.sh 里抽出 use_pkg 真正执行的 node 脚本（保持与实现同步）。 */
+/** 从 scripts/build.sh 里抽出物化函数真正执行的 node 脚本（保持与实现同步）。
+ * 2026-11-18：物化从 `use_pkg`（checkout 专用，源路径写死 `$CHECKOUT/$2`）泛化为
+ * `copy_pkg <src> <dst>`（三级回退要能从 checkout / 本目录 node_modules / 已安装的
+ * dsh 任取源）。抽脚本的锚点随之改为 copy_pkg 的调用尾参。
+ * ⚠️ 别退回去匹配 `"node_modules/$1"`：那是旧形态，匹配不到它会静默抽到**另一个**
+ * node -e（回退链里的 realpathSync），行为用例就拿别的脚本去跑，失败信息完全跑偏。 */
 function extractMaterializeScript() {
-  const m = BUILD_SH.match(/node -e "([\s\S]*?)"\s+"node_modules\/\$1"/)
-  assert.ok(m, '无法从 scripts/build.sh 抽出 use_pkg 的 node 脚本 —— 物化实现可能被改写，请同步本测试')
+  // 先框定 copy_pkg 函数体，再在体内取 node -e —— 直接在全文里匹配
+  // `node -e "…" "$dst" "$src"` 会从上一个 node -e（回退链里的 realpathSync）
+  // 起头、吞掉整段脚本（非贪婪但跨块），行为用例就会去跑一段无关代码。
+  const fn = BUILD_SH.match(/copy_pkg\(\)\s*\{[\s\S]*?\n\}/)
+  assert.ok(fn, '无法在 scripts/build.sh 里定位 copy_pkg() 函数体 —— 物化实现可能被改写，请同步本测试')
+  const m = fn[0].match(/node -e "([\s\S]*?)"\s+"\$dst" "\$src"/)
+  assert.ok(m, '无法从 copy_pkg() 抽出执行的 node 脚本 —— 物化实现可能被改写，请同步本测试')
   return m[1]
 }
 
@@ -176,32 +186,28 @@ describe('构建脚本模板：所有物化点都必须用 copy', () => {
    * 三处物化点：scaffold 模板（SCAFFOLD_BUILD_SH）、自检模板、本项目 build.sh。
    * 前两处嵌在 src/index.ts 里；第三处已由上面的行为测试覆盖。
    */
-  test('src/index.ts 的内嵌 build.sh 模板都不含 symlinkSync 物化', () => {
+  test('src/index.ts 的内嵌 build.sh 模板不含 symlinkSync 物化', () => {
     const src = fs.readFileSync(path.join(ROOT, 'src', 'index.ts'), 'utf8')
 
-    // ⚠️ 两处模板形态不同，必须分别匹配（实测踩坑）：
-    //   · scaffold 模板（SCAFFOLD_BUILD_SH）是**多行**模板字符串 —— use_pkg 跨多行；
-    //   · 自检模板是**单行**字符串，内部用字面 `\n` 转义 —— use_pkg 全在一行里。
-    // 早先只按「多行 + 换行}」匹配，单行模板漏检 → 断言数不足而假失败。
-    const usePkgBodies = []
+    // 单一真源：脚手架模板（SCAFFOLD_BUILD_SH）里的 `copy_pkg() { ... }`。
+    // 2026-11-18 起 dev_self_test 不再内联自己那份精简 build.sh（双源漂移、且只认
+    // DSH_CHECKOUT），而是复用 SCAFFOLD_BUILD_SH —— 故内嵌模板只有一处。
+    const bodies = [...src.matchAll(/copy_pkg\(\)\s*\{[\s\S]*?\n\}/g)].map((m) => m[0])
+    assert.ok(bodies.length >= 1, `脚手架模板里应当有 copy_pkg 物化函数，实际 ${bodies.length} 处`)
 
-    // 形态 1：多行（真换行）——从 `use_pkg() {` 到单独一行的 `}`
-    for (const m of src.matchAll(/use_pkg\(\)\s*\{[\s\S]*?\n\}/g)) usePkgBodies.push(m[0])
-    // 形态 2：单行（字面 \n 转义）——从 `use_pkg() {` 到字面 `\n}`
-    for (const m of src.matchAll(/use_pkg\(\)\s*\{[^\n]*?\\n\}/g)) usePkgBodies.push(m[0])
-
-    assert.ok(
-      usePkgBodies.length >= 2,
-      `应当找到至少 2 处内嵌 use_pkg 模板（scaffold + 自检），实际 ${usePkgBodies.length}`,
-    )
-
-    for (const [i, body] of usePkgBodies.entries()) {
+    for (const [i, body] of bodies.entries()) {
       assert.ok(/cpSync/.test(body), `第 ${i + 1} 处内嵌模板未使用 cpSync 复制`)
+      assert.ok(/dereference:\s*false/.test(body), `第 ${i + 1} 处内嵌模板的 cpSync 必须 dereference:false`)
       assert.ok(
         !/symlinkSync\(/.test(body),
         `第 ${i + 1} 处内嵌模板含 symlinkSync —— 依赖物化不得用 junction（会掏空源）`,
       )
     }
+    // 自检不得再自带一份 build.sh（单一真源约束）
+    assert.ok(
+      !/writeFileSync\(join\(tmpDir, 'scripts', 'build\.sh'\)/.test(src.replace(/writeFileSync\(join\(tmpDir, 'scripts', 'build\.sh'\), SCAFFOLD_BUILD_SH/, '')),
+      'dev_self_test 不应再内联 build.sh —— 复用 SCAFFOLD_BUILD_SH 保持单一真源',
+    )
   })
 
   test('已部署的 lib 里模板同样是 copy 版（若存在）', () => {

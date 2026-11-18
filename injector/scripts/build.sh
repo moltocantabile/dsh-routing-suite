@@ -7,16 +7,54 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 CHECKOUT="${DSH_CHECKOUT:-}"
+
+# ── 依赖源探测（三级回退，2026-11-18 实测缺口修复）──────────────────────
+#   ① DSH_CHECKOUT：源码检出（历史正路，types 直接取自各 package 源码）
+#   ② 本插件目录的 node_modules：`npm install` 过的机器上 tsc + 全部
+#      @deepseek-ai/* 类型都在（本项目自己就是这条路）
+#   ③ 已安装的 dsh 本体：`command -v dsh` → .../node_modules/@deepseek-ai/dsh，
+#      它自带全部 @deepseek-ai/* 与 @types/node，是**与运行时同版本**的类型源
+#      （比源码检出更新、更不易漂移）；tsc 缺失时用 npx 拉（与 tsdown 回退同一策略）
+# 事故：本机只有 npm 全局安装的 dsh，于是 dev_build_plugin / dev_self_test 全死在
+# "cannot locate the dsh checkout"，脚手架产线整体不可用。
+NO_CHECKOUT=0
+DSH_ROOT=""
 if [ -z "$CHECKOUT" ] || [ ! -d "$CHECKOUT/packages" ]; then
-  echo "build: cannot locate the dsh checkout (set DSH_CHECKOUT)" >&2
-  exit 1
+  NO_CHECKOUT=1
+  DSH_BIN="$(command -v dsh 2>/dev/null || true)"
+  if [ -n "$DSH_BIN" ]; then
+    DSH_REAL="$(node -e "try{console.log(require('fs').realpathSync(process.argv[1]))}catch{}" "$DSH_BIN" 2>/dev/null || true)"
+    if [ -n "$DSH_REAL" ]; then
+      # .../lib/bin.js → .../@deepseek-ai/dsh
+      CAND="$(dirname "$(dirname "$DSH_REAL")")"
+      if [ -d "$CAND/node_modules/@deepseek-ai" ]; then DSH_ROOT="$CAND"; fi
+    fi
+  fi
+  HAVE_LOCAL_DEPS=0
+  if [ -d node_modules/@types/node ] && [ -d node_modules/@deepseek-ai/dsh-tools ]; then HAVE_LOCAL_DEPS=1; fi
+  if [ "$HAVE_LOCAL_DEPS" = 1 ]; then
+    echo "build: no dsh checkout — using this package's node_modules"
+  elif [ -n "$DSH_ROOT" ]; then
+    echo "build: no dsh checkout — materializing types from the installed dsh ($DSH_ROOT)"
+  else
+    echo "build: cannot locate a dependency source (set DSH_CHECKOUT, or \`npm install\`, or install dsh)" >&2
+    exit 1
+  fi
 fi
 
-TSC="$CHECKOUT/node_modules/.bin/tsc"
-if [ ! -x "$TSC" ]; then
-  echo "build: tsc not found at $TSC" >&2
-  exit 1
+# tsc 解析顺序：本地 → checkout → npx（TSC 为空表示走 npx）
+TSC=""
+if [ -x node_modules/.bin/tsc ]; then
+  TSC="node_modules/.bin/tsc"
+elif [ -n "$CHECKOUT" ] && { [ -x "$CHECKOUT/node_modules/.bin/tsc" ] || [ -f "$CHECKOUT/node_modules/.bin/tsc.cmd" ]; }; then
+  TSC="$CHECKOUT/node_modules/.bin/tsc"
 fi
+run_tsc() {
+  if [ -n "$TSC" ]; then "$TSC" "$@"; else
+    echo "  local tsc not found — fetching via npx (first run only)"
+    npx --yes -p "typescript@^5.9.3" tsc "$@"
+  fi
+}
 
 # ⚠️ 依赖物化用 **copy**，绝不用 junction（2026-10-15 终版定案）。
 #
@@ -31,6 +69,28 @@ fi
 #   3) 结论：只要用 junction，「源目录是否安全」就依赖 Node 未定义行为。故改为
 #      **cpSync 复制** —— 源目录从此只在读取侧被访问，物理上不可能被写坏。
 #      代价：每次构建多复制几 MB（实测 <1s），换依赖永不被掏空，值得。
+# 通用物化：$1 = 源绝对路径，$2 = 目标相对路径
+copy_pkg() {
+  local src="$1" dst="$2"
+  if [ ! -e "$src" ]; then
+    echo "build: dependency target missing: $src" >&2
+    exit 1
+  fi
+  node -e "
+    const fs = require('fs');
+    const path = require('path');
+    const dst = path.resolve(process.argv[1]);
+    const src = path.resolve(process.argv[2]);
+    try {
+      const st = fs.lstatSync(dst);
+      if (st.isSymbolicLink()) { try { fs.unlinkSync(dst) } catch { fs.rmdirSync(dst) } }
+      else fs.rmSync(dst, { recursive: true, force: true });
+    } catch { /* 不存在则无需删除 */ }
+    fs.mkdirSync(path.dirname(dst), { recursive: true });
+    fs.cpSync(src, dst, { recursive: true, dereference: false, filter: (s) => path.basename(s) !== 'node_modules' });
+  " "$dst" "$src"
+}
+
 use_pkg() {
   local target="$CHECKOUT/$2"
   if [ ! -e "$target" ]; then
@@ -59,56 +119,51 @@ use_pkg() {
 # 兼容历史调用名
 link_pkg() { use_pkg "$@"; }
 
-echo "=== Linking build dependencies (checkout: $CHECKOUT) ==="
-mkdir -p node_modules/@deepseek-ai
-node -e "const fs=require('fs');fs.rmSync('node_modules/@standard-schema',{recursive:true,force:true})"
-# ⚠️ 链接名必须与 src 的 import 说明符**逐字一致**（实测踩坑 2026-10-15）：
-# 提交 1df6cde 把源码 import 从裸名（cordis/schemastery）改成 scoped
-# （@deepseek-ai/cordis 等），但本文件仍链裸名 —— tsc 直接报 6 个
-# TS2307「Cannot find module '@deepseek-ai/cordis'」，lib 根本编不出来。
-# 决定性证据：补上 scoped 链接后 6 个 TS2307 全部消失、lib/index.js 正常产出。
-link_pkg @deepseek-ai/cordis vendor/cordis
-link_pkg @deepseek-ai/cosmokit vendor/cosmokit
-link_pkg @deepseek-ai/schemastery vendor/schemastery
-link_pkg @deepseek-ai/dsh-tools packages/core/tools
-# src 直接 import 了 @deepseek-ai/dsh-llm（LLM 自主 loop 用）——缺它同样 TS2307。
-link_pkg @deepseek-ai/dsh-llm packages/llm/llm
-link_pkg @deepseek-ai/dsh-system-prompt packages/core/system-prompt
-link_pkg @deepseek-ai/cordis-plugin-loader vendor/loader
+if [ "$NO_CHECKOUT" = 1 ]; then
+  echo "=== Materializing build dependencies (from the installed dsh) ==="
+  if [ ! -d node_modules/@deepseek-ai/dsh-tools ] && [ -n "$DSH_ROOT" ]; then
+    mkdir -p node_modules/@deepseek-ai
+    for pkg in cordis cosmokit schemastery dsh-tools dsh-llm dsh-system-prompt cordis-plugin-loader; do
+      if [ -d "$DSH_ROOT/node_modules/@deepseek-ai/$pkg" ]; then
+        copy_pkg "$DSH_ROOT/node_modules/@deepseek-ai/$pkg" "node_modules/@deepseek-ai/$pkg"
+      fi
+    done
+    if [ -d "$DSH_ROOT/node_modules/@types/node" ]; then
+      copy_pkg "$DSH_ROOT/node_modules/@types/node" "node_modules/@types/node"
+    fi
+  else
+    echo "  using existing node_modules (npm install)"
+  fi
+else
+  echo "=== Linking build dependencies (checkout: $CHECKOUT) ==="
+  mkdir -p node_modules/@deepseek-ai
+  node -e "const fs=require('fs');fs.rmSync('node_modules/@standard-schema',{recursive:true,force:true})"
+  # ⚠️ 链接名必须与 src 的 import 说明符**逐字一致**（实测踩坑 2026-10-15）：
+  # 提交 1df6cde 把源码 import 从裸名（cordis/schemastery）改成 scoped
+  # （@deepseek-ai/cordis 等），但本文件仍链裸名 —— tsc 直接报 6 个
+  # TS2307「Cannot find module '@deepseek-ai/cordis'」，lib 根本编不出来。
+  # 决定性证据：补上 scoped 链接后 6 个 TS2307 全部消失、lib/index.js 正常产出。
+  link_pkg @deepseek-ai/cordis vendor/cordis
+  link_pkg @deepseek-ai/cosmokit vendor/cosmokit
+  link_pkg @deepseek-ai/schemastery vendor/schemastery
+  link_pkg @deepseek-ai/dsh-tools packages/core/tools
+  # src 直接 import 了 @deepseek-ai/dsh-llm（LLM 自主 loop 用）——缺它同样 TS2307。
+  link_pkg @deepseek-ai/dsh-llm packages/llm/llm
+  link_pkg @deepseek-ai/dsh-system-prompt packages/core/system-prompt
+  link_pkg @deepseek-ai/cordis-plugin-loader vendor/loader
 
-# @types/node：tsconfig 写了 types:["node"]，缺它就 TS2688 直接编不动（实测踩坑：
-# 没有 node_modules 的干净检出/换机器即构建失败——产线必须自洽，不靠某台机器的残留）。
-TYPES_NODE="$CHECKOUT/node_modules/@types/node"
-if [ ! -d "$TYPES_NODE" ]; then
-  echo "build: @types/node not found at $TYPES_NODE" >&2
-  exit 1
-fi
-# 同样用 copy（不用 junction）——理由见上面 use_pkg 的长注释。
-node -e "
-  const fs = require('fs');
-  const path = require('path');
-  const dst = path.resolve('node_modules/@types/node');
-  const src = path.resolve(process.argv[1]);
-  try {
-    const st = fs.lstatSync(dst);
-    if (st.isSymbolicLink()) { try { fs.unlinkSync(dst) } catch { fs.rmdirSync(dst) } }
-    else fs.rmSync(dst, { recursive: true, force: true });
-  } catch { /* 不存在则无需删除 */ }
-  fs.mkdirSync(path.dirname(dst), { recursive: true });
-  fs.cpSync(src, dst, { recursive: true, dereference: false, filter: (s) => path.basename(s) !== 'node_modules' });
-" "$TYPES_NODE"
-
-# ⚠️ 这里的 `find ... | head -1` 在 `set -o pipefail` 下会**误杀脚本**（实测踩坑）：
-# head 读够 1 行就退出 → find 收到 SIGPIPE（退出码 141）→ pipefail 判定整条管道失败
-# → `set -e` 直接终止构建。此时既无报错信息、也没进 tsc，表现为"构建静默停在
-# Linking 之后、lib 不产出"，极难定位。正解：管道尾部补 `|| true` 吃掉这个状态。
-STD_SCHEMA=$( { find "$CHECKOUT/node_modules/.pnpm" -maxdepth 1 -type d -iname '@standard-schema+spec@*' 2>/dev/null || true; } | head -1 || true)
-if [ -n "$STD_SCHEMA" ]; then
+  # @types/node：tsconfig 写了 types:["node"]，缺它就 TS2688 直接编不动（实测踩坑：
+  # 没有 node_modules 的干净检出/换机器即构建失败——产线必须自洽，不靠某台机器的残留）。
+  TYPES_NODE="$CHECKOUT/node_modules/@types/node"
+  if [ ! -d "$TYPES_NODE" ]; then
+    echo "build: @types/node not found at $TYPES_NODE" >&2
+    exit 1
+  fi
   # 同样用 copy（不用 junction）——理由见上面 use_pkg 的长注释。
   node -e "
     const fs = require('fs');
     const path = require('path');
-    const dst = path.resolve('node_modules/@standard-schema/spec');
+    const dst = path.resolve('node_modules/@types/node');
     const src = path.resolve(process.argv[1]);
     try {
       const st = fs.lstatSync(dst);
@@ -117,13 +172,35 @@ if [ -n "$STD_SCHEMA" ]; then
     } catch { /* 不存在则无需删除 */ }
     fs.mkdirSync(path.dirname(dst), { recursive: true });
     fs.cpSync(src, dst, { recursive: true, dereference: false, filter: (s) => path.basename(s) !== 'node_modules' });
-  " "$STD_SCHEMA/node_modules/@standard-schema/spec"
-else
-  echo "build: @standard-schema/spec not found; skipLibCheck should cover it" >&2
+  " "$TYPES_NODE"
+
+  # ⚠️ 这里的 `find ... | head -1` 在 `set -o pipefail` 下会**误杀脚本**（实测踩坑）：
+  # head 读够 1 行就退出 → find 收到 SIGPIPE（退出码 141）→ pipefail 判定整条管道失败
+  # → `set -e` 直接终止构建。此时既无报错信息、也没进 tsc，表现为"构建静默停在
+  # Linking 之后、lib 不产出"，极难定位。正解：管道尾部补 `|| true` 吃掉这个状态。
+  STD_SCHEMA=$( { find "$CHECKOUT/node_modules/.pnpm" -maxdepth 1 -type d -iname '@standard-schema+spec@*' 2>/dev/null || true; } | head -1 || true)
+  if [ -n "$STD_SCHEMA" ]; then
+    # 同样用 copy（不用 junction）——理由见上面 use_pkg 的长注释。
+    node -e "
+      const fs = require('fs');
+      const path = require('path');
+      const dst = path.resolve('node_modules/@standard-schema/spec');
+      const src = path.resolve(process.argv[1]);
+      try {
+        const st = fs.lstatSync(dst);
+        if (st.isSymbolicLink()) { try { fs.unlinkSync(dst) } catch { fs.rmdirSync(dst) } }
+        else fs.rmSync(dst, { recursive: true, force: true });
+      } catch { /* 不存在则无需删除 */ }
+      fs.mkdirSync(path.dirname(dst), { recursive: true });
+      fs.cpSync(src, dst, { recursive: true, dereference: false, filter: (s) => path.basename(s) !== 'node_modules' });
+    " "$STD_SCHEMA/node_modules/@standard-schema/spec"
+  else
+    echo "build: @standard-schema/spec not found; skipLibCheck should cover it" >&2
+  fi
 fi
 
-echo "=== Compiling src → lib (tsc $("$TSC" --version)) ==="
-"$TSC" -p tsconfig.json
+echo "=== Compiling src → lib ==="
+run_tsc -p tsconfig.json
 
 # ═══════════════════════════════════════════════════════════════════════
 # UI（client bundle）也必须在 build.sh 里构建
