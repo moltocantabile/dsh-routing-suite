@@ -114,7 +114,6 @@ dsh plugin --profile web add github:yjh051108/dsh-super-injector
 **设计原则**：
 
 1. **不发明协议**：注入的是标准插件包（package.json + lib/），格式就是官方包格式，装上即官方语义；
-2. **双路径，尊重"配置唯一"**：运行时注入（免重启，开发态）↔ `dev_install_package` 落 profile bundles（重启后由官方接管，生产态）——注入清单只是**运行时恢复缓存**，不是第二安装数据库；
 3. **模型可驱动**：dev_* 全是工具，agent 自己注入/卸载/转正——正踩在官方"agent 自己管理运行时"的方向上；
 4. **可逆且自愈**：注入可回滚（失败保旧代）、卸载即净（fiber 全清理）、残留可自愈（路由/缓存/entry 自动清理）。
 
@@ -127,7 +126,6 @@ dsh plugin --profile web add github:yjh051108/dsh-super-injector
 | `dev_inject_plugin` | 运行时注入本地插件包（junction 链接 + loader.create，`hasActiveEntry` 防重） |
 | `dev_uninject_plugin` | 一键卸载注入模组（fiber dispose 全清理；bundle 插件自动写 disabled 阻断自装配） |
 | `dev_injected_list` | 列出注入清单 |
-| `dev_install_package` | 热装配本地 bundle 插件（profile package.json + junction + loader.create，重启后由 bundles 列表正常装配） |
 | `dev_reload_package` | 整包热重载（清缓存 → 重新 import → 重建 fiber，失败回滚保留旧代；含自重载） |
 | `dev_plugin_status` | 已装配插件清单、fiber 状态与操作成功率统计 |
 | `dev_clear_routes` | webserver 路由残留自愈（按 path 前缀删除孤儿路由） |
@@ -136,6 +134,8 @@ dsh plugin --profile web add github:yjh051108/dsh-super-injector
 | `dev_stage_list` | 列出侧挂工具（含转正状态） |
 | `dev_stage_promote` | 一键转正：侧挂工具挂前侧正式注册（唯一一次缓存刷新） |
 | `dev_stage_demote` | 撤回/注销侧挂或已转正工具 |
+
+**持久安装**请用官方路径：侧栏「插件 → 添加插件」（支持本地目录 / Git / npm / 让 agent 创建），或 CLI `dsh plugin --profile web add <spec>`；注入器的 runtime 通道只管"加载但不写 profile"的使用场景。
 
 ## 插件开发指南（生产线）
 

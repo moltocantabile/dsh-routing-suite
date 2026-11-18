@@ -6,10 +6,9 @@
  *
  * 能力：
  *  1. dev_inject_plugin     — 运行时注入本地插件包（junction + loader.create，免持久化）
- *  2. dev_install_package   — 双路径热装配（profile package.json + junction + loader.create，重启后由 bundles 接管）
- *  3. dev_reload_package    — 确定性整包热重载（清缓存 → import → registry 重建 fiber，失败回滚）
- *  4. dev_plugin_status     — 已装配插件清单（id/name/fiber 状态/入口）
- *  5. dev_injected_list     — 注入清单（registry.json，重启自动恢复）
+ *  2. dev_reload_package    — 确定性整包热重载（清缓存 → import → registry 重建 fiber，失败回滚）
+ *  3. dev_plugin_status     — 已装配插件清单（id/name/fiber 状态/入口）
+ *  4. dev_injected_list     — 注入清单（registry.json，重启自动恢复）
  *  6. 自动轮询 watch        — lib 产物指纹变化 → 自动热重载
  *  7. 静态能力提示注入       — 固定文本 + order 靠前（静态到头：工具 schema
  *     变更时静态段仍缓存命中；动态内容才走尾部/消息尾）
@@ -807,7 +806,7 @@ export function apply(ctx: AppContext, config: Config): void {
   logger.info('[super-injector] profile 解析: %s（via %s）', profileNodeModules, _profile.via)
 
   /** 当前 profile 的**名字**（从已推导的 node_modules 路径取上级目录名）。
-   * 供 dev_install_package 之类"缺省操作哪个 profile"的调用点使用——
+   * 供"缺省操作哪个 profile"的调用点使用——
    * 避免各处再写死 'web'（缺陷 A 同族）。 */
   function currentProfileName(): string {
     try {
@@ -941,37 +940,6 @@ export function apply(ctx: AppContext, config: Config): void {
       appendFileSync(selfHealLogFile, `[${new Date().toISOString()}] ${event}: ${detail}\n`)
     } catch { /* 审计写失败不阻塞 */ }
   }
-
-  // ═══ 未处理 rejection 常驻兜底（2026-09-12 崩溃循环案底）═══
-  // 案底：后侧工具里一个**未被 await 的 rejection** 逃出工具栈 → Node 默认把它升级成
-  // 未捕获异常 → 宿主 `dsh: fatal load failure` 退出 code=1 → 桌面壳无条件重启 → 崩溃循环，
-  // 用户体感「DSH 反反复复重启」。两次实测同型：SessionQueryError（本部署 session-query
-  // 配成 openAt:"never"，搜索被禁用）、以及负对照里故意造的 Promise.reject。
-  // ⚠️ 第一版修法（只在 dev_stage_call 的调用窗口内挂监听）**被负对照当场打红**：
-  //    unhandledRejection 是在微任务队列**排空之后**才上报的，`finally` 摘监听时它还没上报，
-  //    窗口一关等于没挂。故改为**常驻**：整个进程生命周期挂住，逃逸一律降级成日志 + 计数，
-  //    绝不升级成宿主退出。
-  // 代价（诚实标注）：宿主范围内任何 unhandledRejection 都不再崩进程 —— 会掩盖别处的 bug。
-  // 缓解：每次逃逸都落 self-heal.log，可审计、不静默。用 Symbol.for + globalThis 存状态，
-  // 热重载不会重复挂监听（否则每重载一次就多叠一层）。
-  try {
-    const SHIELD = Symbol.for('dsh.super-injector.rejection-shield')
-    const g = globalThis as unknown as Record<symbol, { count: number; handler: (reason: unknown) => void } | undefined>
-    if (!g[SHIELD]) {
-      const state = { count: 0, handler: (_reason: unknown): void => { /* 占位，下面立刻覆写 */ } }
-      state.handler = (reason: unknown): void => {
-        state.count += 1
-        const text = reason instanceof Error ? (reason.stack ?? reason.message) : String(reason)
-        auditLog('escaped-rejection', `#${state.count} ${String(text).slice(0, 400)}`)
-        try {
-          logger.warn('[super-injector] 未处理 rejection 已降级（宿主未退出）: %s', String(text).slice(0, 200))
-        } catch { /* 日志失败不阻断 */ }
-      }
-      process.on('unhandledRejection', state.handler)
-      g[SHIELD] = state
-      auditLog('rejection-shield', '常驻兜底已安装（unhandledRejection 不再导致宿主退出）')
-    }
-  } catch { /* 兜底安装失败不阻断插件 */ }
 
   /** 日志轮转（D）：超限后滚动 .1/.2，保留 2 代，防长期运行无限增长。 */
   function rotateLog(file: string): void {
@@ -2868,7 +2836,8 @@ export function apply(ctx: AppContext, config: Config): void {
     // ⚠️ bundles 防重护栏（2026-09-08 closedloop 双装配事故）：包已列进 profile
     // package.json 的 dsh.profile.bundles 时，重启后由 bundles 正常装配——此处再
     // 恢复会造第二实例（boot 早期 bundle entry 尚未 active，hasActiveEntry 拦不住），
-    // 命中 duplicate namespace/route 直接炸整棵 plugin tree。dev_install_package 后
+    // 命中 duplicate namespace/route 直接炸整棵 plugin tree。持久安装（dsh plugin add /
+    // 侧栏「插件」页）后
     // registry 若残留旧 dev_inject 条目即触发；跳过 + 审计，不删条目（保留观感）。
     const bundlesOwned = new Set(readProfileBundles())
     for (const e of readRegistry()) {
@@ -3184,45 +3153,6 @@ export function apply(ctx: AppContext, config: Config): void {
   }))
 
   safeRegister(defineTool({
-    name: 'dev_reload_preset',
-    description: '预设热更新（agent-presets 新一代，绕 ESM 缓存）：给 .agent-presets/<preset>/agent.cordis.yml 的相对 .mjs 引用加 ?v=N query（N 自增）——组合文件指纹变化 → 新会话挂载新一代 → 新 URL 无缓存命中 → 改代码无需换文件名/重启即可生效。已运行会话保持旧代。',
-    parameters: {
-      preset: { type: 'string', description: '预设 id（缺省 = 全部）' },
-    },
-    output: {
-      schema: { type: 'string' },
-      render: (_args: unknown, value: unknown) => [{ type: 'text', text: String(value) }],
-    },
-    async execute(args: { preset?: string }) {
-      const presetsRoot = join(dshHome, '.agent-presets')
-      const names = args.preset
-        ? [args.preset]
-        : (() => { try { return readdirSync(presetsRoot).filter((d) => !d.startsWith('.')) } catch { return [] } })()
-      if (!names.length) return 'ERROR: 未找到任何预设（' + presetsRoot + '）'
-      const out: string[] = []
-      for (const name of names) {
-        const ymlFile = join(presetsRoot, name, 'agent.cordis.yml')
-        if (!existsSync(ymlFile)) { out.push('[' + name + '] 无 agent.cordis.yml（跳过）'); continue }
-        let yml = ''
-        try { yml = readFileSync(ymlFile, 'utf8') } catch { out.push('[' + name + '] 读取失败（跳过）'); continue }
-        const refRe = /(name: \.\/[A-Za-z0-9._-]+\.mjs)(\?v=\d+)?/g
-        const refs = [...yml.matchAll(refRe)]
-        if (!refs.length) { out.push('[' + name + '] 无相对 .mjs 引用（无需热更新）'); continue }
-        const changed: string[] = []
-        for (const m of refs) {
-          const base = m[1]
-          const cur = m[2] ? Number(m[2].slice(3)) : 0
-          yml = yml.replace(m[0], base + '?v=' + (cur + 1))
-          changed.push(base.split('/').pop() + ' -> ?v=' + (cur + 1))
-        }
-        try { writeFileSync(ymlFile, yml, 'utf8') } catch { out.push('[' + name + '] 写入失败（跳过）'); continue }
-        out.push('[' + name + '] ' + changed.join(', '))
-      }
-      return 'OK: 预设热更新\n- ' + out.join('\n- ') + '\n注：新会话挂载新一代（新 URL 绕 ESM 缓存）；已运行会话保持旧代'
-    },
-  }))
-
-  safeRegister(defineTool({
     name: 'dev_heal_links',
     description: 'profile link: 依赖 junction 自愈（手动触发，免重启）：扫描 profile package.json 全部 link: 依赖（bundles 装配依赖 + agent preset 解析依赖），悬空/缺失的 node_modules junction 重建。返回重建清单。',
     parameters: {},
@@ -3316,95 +3246,6 @@ export function apply(ctx: AppContext, config: Config): void {
         ? '\n===== 最近失败（可审计）=====\n' + opStats.lastFailures.map((f) => `[${f.kind} ${f.at}] ${f.reason || '（无原因）'}`).join('\n')
         : ''
       return `===== 操作统计（跨重启累计）=====\n${summary}${failLines}${auditSummary()}\n\n===== 当前已装配插件（loader entries）=====\n` + listPlugins()
-    },
-  }))
-
-  safeRegister(defineTool({
-    name: 'dev_install_package',
-    description: '热装配一个本地 bundle 插件：改 profile package.json（dependencies 加 link + bundles 数组加包名）→ 建 node_modules junction → loader.create 动态加载（免重启生效）。幂等：已存在的项自动跳过。重启后由 bundles 列表正常装配（双路径一致）',
-    parameters: {
-      dir: {
-        type: 'string',
-        required: true,
-        description: '插件包目录绝对路径（须含 package.json，且已 build 出 lib/）',
-      },
-      profile: {
-        type: 'string',
-        description: '目标 profile 名（缺省 web）',
-      },
-    },
-    output: {
-      schema: { type: 'string' },
-      render: (_args: unknown, value: unknown) => [{ type: 'text', text: String(value) }],
-    },
-    async execute(args: { dir: string; profile?: string }) {
-      return withOpLock(async () => {
-      const dir = String(args.dir)
-      // ⚠️ 缺省 profile 名必须取**当前 profile**（缺陷 A 同族，2026-10-15 修）：
-      // 旧实现写死 'web'，在 desktop profile 下会把包装进另一个 profile
-      // ⇒ 当前进程永远看不到（正是 dev_inject_plugin 报 host ✗ 的同一根因）。
-      const profileName = args.profile ? String(args.profile) : currentProfileName()
-      try {
-        const pkgPath = join(dir, 'package.json')
-        if (!existsSync(pkgPath)) return 'ERROR: 目录无 package.json: ' + dir
-        const pkg = JSON.parse(readFileSync(pkgPath, 'utf8'))
-        const name = pkg.name
-        if (typeof name !== 'string' || !name) return 'ERROR: package.json 缺 name'
-
-        const home = process.env.DSH_HOME || join(homedir(), '.dsh')
-        const profileDir = join(home, 'profiles', profileName)
-        const profilePkgPath = join(profileDir, 'package.json')
-        if (!existsSync(profilePkgPath)) return 'ERROR: profile 不存在: ' + profileDir
-        const steps: string[] = []
-
-        // 改 profile package.json（dependencies + bundles，幂等）
-        const raw = readFileSync(profilePkgPath, 'utf8')
-        const profilePkg = JSON.parse(raw)
-        profilePkg.dependencies = profilePkg.dependencies ?? {}
-        profilePkg.dsh = profilePkg.dsh ?? {}
-        profilePkg.dsh.profile = profilePkg.dsh.profile ?? {}
-        profilePkg.dsh.profile.bundles = profilePkg.dsh.profile.bundles ?? []
-        if (profilePkg.dependencies[name]) steps.push('dependencies 已存在（跳过）')
-        else { profilePkg.dependencies[name] = 'link:' + dir; steps.push('dependencies += ' + name) }
-        if (profilePkg.dsh.profile.bundles.includes(name)) steps.push('bundles 已存在（跳过）')
-        else { profilePkg.dsh.profile.bundles.push(name); steps.push('bundles += ' + name) }
-        writeFileSync(profilePkgPath, JSON.stringify(profilePkg, null, 2) + '\n', 'utf8')
-
-        // node_modules junction（@scope/name 两级目录）
-        const scope = name.startsWith('@') ? name.split('/')[0] : null
-        const linkDir = scope ? join(profileDir, 'node_modules', scope) : join(profileDir, 'node_modules')
-        const linkPath = join(linkDir, scope ? name.split('/')[1] as string : name)
-        if (existsSync(linkPath)) steps.push('node_modules link 已存在（跳过）')
-        else {
-          mkdirSync(linkDir, { recursive: true })
-          symlinkSync(dir, linkPath, 'junction')
-          steps.push('node_modules link 已建立')
-        }
-
-        // loader.create 动态加载（幂等：entry 已存在则跳过）
-        let exists = false
-        for (const entry of ctx.loader.entries()) {
-          const opts = entry.options as { name?: string }
-          if (opts?.name === name) { exists = true; break }
-        }
-        if (exists) {
-          steps.push('loader entry 已存在（跳过 create）')
-          normalizeEntriesByName(name)
-          refreshClientRow(name)
-        } else {
-          await ctx.loader.create({ name })
-          normalizeEntriesByName(name)
-          refreshClientRow(name)
-          steps.push('loader.create 已热装配（免重启生效）')
-        }
-
-        const client = clientStatus(name)
-        recordOp('install', steps.some(s => s.startsWith('dependencies +=') || s.startsWith('dependencies 已存在')))
-        return 'OK: ' + name + ' 热装配完成\n- ' + steps.join('\n- ') + `\n- ${client}\n（重启后由 bundles 列表正常装配，双路径一致；patch 层配置重启后接管）`
-      } catch (e) {
-        return 'ERROR: 安装失败: ' + String(e)
-      }
-      })
     },
   }))
 
@@ -4160,42 +4001,15 @@ export function apply(ctx: AppContext, config: Config): void {
   // ═══════════════════════════════════════════════════════════════════
   // 插件管理 UI API（settings.section 页面后端）
   // 端点：GET /list（registry+状态+统计）、POST /uninstall{match}、
-  //       POST /inject{dir}、POST /ingest{dir,title}（新建会话内化）
+  //       POST /inject{dir}（目录已是插件包 → 立即注入）
+  // 旧 POST /ingest（新建会话让 AI 把文件夹内化成插件）已移除：DSH 内置
+  // 侧栏「插件 → 添加插件 → 让 agent 创建插件」（Creator 预设）覆盖该流程，
+  // 且产出的包是 bundle，可由官方安装器管理。
   // ═══════════════════════════════════════════════════════════════════
   async function readBody(req: any): Promise<string> {
     const chunks: Buffer[] = []
     for await (const c of req) chunks.push(Buffer.from(c))
     return Buffer.concat(chunks).toString('utf8')
-  }
-
-  /** 新建 agent 会话，把任意目录内化成插件（AI 自主完成分析→脚手架→构建→注入）。 */
-  async function startIngest(dir: string, title?: string): Promise<string> {
-    const abs = resolve(dir)
-    if (!existsSync(abs)) return 'ERROR: 目录不存在: ' + abs
-    const agentsSvc = ctx.get('agents') as { create?: (options: any) => Promise<{ agent: { id: string } }> } | undefined
-    if (!agentsSvc || typeof agentsSvc.create !== 'function') return 'ERROR: agents 服务不可用（无法新建会话）'
-    const sessionId = 'ingest-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6)
-    const prompt = `请把目录 ${abs} 里的内容**内化成 DSH 插件**。步骤：①分析内容（代码/脚本/配置/文档/资源，任意形态）②决定插件形态（toolkit 工具包 / daemon-loop 守护循环 / ui-panel UI 面板 / hybrid 混合）③用 dev_scaffold_plugin 生成骨架或直接编写插件包（package.json/tsconfig/scripts/build.sh/src）④dev_build_plugin 构建⑤dev_inject_plugin 注入⑥dev_self_test 自检确认。若内容本身已是可注入插件包（含 package.json+lib/）则直接构建注入。完成后汇报插件名与用途。`
-    const seed = [{
-      type: 'user/message',
-      seq: 0,
-      time: Date.now(),
-      // ⚠️ user/message 的 data 就是消息本体（dsh-session 事件契约），不能包一层
-      // `message:`——嵌套形状会让 router-standard 的 sessionMode 提取不到文本，
-      // 插件生成的首条消息被误判 weak（router-standard issue #1 联动修复）。
-      data: {
-        kind: 'user',
-        source: { kind: 'user' },
-        content: [{ type: 'text', text: prompt }],
-      },
-    }]
-    const handle = await agentsSvc.create({
-      sessionId,
-      meta: { cwd: process.cwd() },
-      seed,
-    })
-    auditLog('ingest-session', `${abs} → 会话 ${handle.agent.id}（${title ?? '内化插件'}）`)
-    return `OK: 内化会话已创建（${handle.agent.id}）——AI 正在把内容变成插件，会话列表可见`
   }
 
   ctx.effect(() => ctx.webServer.register({
@@ -4225,13 +4039,6 @@ export function apply(ctx: AppContext, config: Config): void {
           const dir = String(body?.dir ?? '').trim()
           if (!dir) return send(400, { ok: false, error: 'dir 必填' })
           const result = await inject(dir)
-          return send(200, { ok: true, result })
-        }
-        if (req.method === 'POST' && path === '/ingest') {
-          const body = JSON.parse(await readBody(req))
-          const dir = String(body?.dir ?? '').trim()
-          if (!dir) return send(400, { ok: false, error: 'dir 必填（要内化成插件的文件夹路径）' })
-          const result = await startIngest(dir, String(body?.title ?? ''))
           return send(200, { ok: true, result })
         }
         return send(404, { ok: false, error: 'not found: ' + path })

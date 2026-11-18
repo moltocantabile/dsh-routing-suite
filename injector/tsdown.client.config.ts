@@ -26,6 +26,9 @@ const CLIENT_EXTERNALS = [
   'react', 'react/jsx-runtime', 'react-dom', 'react-dom/client',
   'cordis',
   '@deepseek-ai/dsh-client-ui-slots',
+  // 平台 seed 模块：磁盘上不存在，运行时由 shell 的静态模块表提供。打进 bundle
+  // 会复制一份原语与 CSS、并与宿主设计体系脱钩（构建期 externals 漂移）。
+  '@deepseek-ai/dsh-client-ui-primitives',
   '@deepseek-ai/dsh-client-runtime/client',
 ]
 

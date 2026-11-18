@@ -7,6 +7,51 @@
 
 ## [未发布] — 2026-11-18（DSH 0.2.1-rc.2 / macOS 兼容修复）
 
+### 变更（UI 对齐 DSH 设计体系）
+
+- **设置页面板重写为原生观感**：旧实现用 `--theme-border/--theme-text/--theme-accent`
+  等变量——这套变量在 DSH 0.2.1 里**根本不存在**（全站只有 `--dsw-*`），每个
+  `var(--theme-x, #深色硬编码)` 都静默走兜底 ⇒ 浅色主题下整页发黑；叠加等宽字体、
+  1.5px 边框、6px 圆角、手写 `.st.on/.st.off` 药丸，与原生设置页明显不是一套。
+  现改为：
+  - 全部走 `--dsw-*` 设计 token（`--dsw-alias-label-*` / `--dsw-alias-settings-card-*`
+    / `--dsw-radius-*` / `--dsw-alias-state-*`），`.5px` 细线、卡片行、
+    `color-mix` 淡底——与官方「插件」页同款配方；
+  - 使用平台 UI 原语 `@deepseek-ai/dsh-client-ui-primitives`（seed 模块：
+    `Button` / `Input` / `Tag` / `StateDot` + 官方图标），不再手搓按钮药丸；
+  - 结构与官方 section 同构：`h2` 18/600 + 13/20 三级灰说明 + 状态行 + 卡片列表；
+  - 样式按官方模式注入一次（`style[data-plugin-css]` 去重守卫）。
+- **页面语义收敛为「注入插件」**：持久安装/启停由官方侧栏「插件」页承担，
+  本页只负责官方看不到卸载入口的**运行时注入条目**。
+- **60s 常驻轮询移除**：改为挂载时拉取 + 操作后刷新（减少空转请求）。
+
+### 移除（DSH 0.2.1 已覆盖，避免双实现漂移）
+
+- `dev_reload_preset`：**死代码**——它改写 `~/.dsh/.agent-presets/<id>/agent.cordis.yml`
+  的 `?v=N`，而 0.2.1 已不再读该目录（官方 skill 明写 "Nothing reads that directory
+  any more"，本机该目录也不存在）。预设现在是 bundle 里的 `@deepseek-ai/dsh-agent-preset`
+  声明行，由设置页「Agent 预设」/ patch 编辑 + HMR 重组承担。
+- `dev_install_package`：官方 `plugin-manager` 的 `installBundle` 做同一件事且更完整
+  （pnpm 语义 + 失败回滚 package.json/lockfile + 引擎/peer 兼容拒绝 + 取消/重试 +
+  `hmr.reconcileProfile` 热应用）。替代路径：侧栏「插件 → 添加插件」、
+  `dsh plugin --profile web add <spec>`、Creator 预设的 `plugin_manager{install_bundle}`。
+  （本部署 `tool-plugin-manager` 默认 disabled，故 agent 侧改用 CLI/预设。）
+- `startIngest` + `POST /super-injector/api/ingest`：官方「添加插件 ▸ 让 agent 创建插件」
+  （Creator 预设 + `cordis-plugin-development` skill）覆盖该流程，且产出是 bundle，
+  能被官方安装器管理；手搓会话 seed 的版本反而产出非 bundle 包。
+- **进程级 `unhandledRejection` 常驻兜底**：它把**任何**插件（含 DSH 自身）的逃逸
+  rejection 都降级成日志，等于把致命 bug 静默掉（代码注释里也承认）。`dev_stage_call`
+  的**调用窗口内**捕获保留（安全、只影响自身）。
+
+### 新增（回归锁）
+
+- `tests/client-render.test.mjs`：读**构建产物** `lib/client.js`，在 ModuleLoader 包装下
+  求值 + jsdom 真挂载，锁三件事：①注册的是 React 组件而非 `{render()}` 工厂
+  （空白页病案 ①）②DOM 有列表行/状态标签/卸载按钮（空白页病案 ②）
+  ③样式表**只含 `--dsw-*`**、不得出现 `--theme-*` 与等宽正文字体（本次视觉脱轨）。
+  另覆盖空列表分支。devDependencies 增 `react` / `react-dom` / `jsdom`（仅测试用）。
+
+
 > 同步上游 main（v0.3.6 线）后，在 DSH 0.2.1-rc.2 + macOS arm64 上实测定位并修复。
 
 ### 修复
