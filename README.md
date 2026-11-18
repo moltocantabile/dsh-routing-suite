@@ -24,54 +24,67 @@
 
 ## 一键安装
 
-```powershell
+**方式 A（推荐）：拉仓库 + 一键安装脚本**（注入器装配 + 预设复制 + 布局自检）
+
+```bash
+git clone https://github.com/yjh051108/dsh-routing-suite.git
+cd dsh-routing-suite
+
+bash install.sh        # macOS / Linux
+.\install.ps1          # Windows（PowerShell）
+```
+
+**方式 B：只装 bundle**（注入器；不含 router 预设）
+
+```bash
 dsh plugin --profile web add github:yjh051108/dsh-routing-suite
 ```
 
 > 本套装已含上述三组件（injector/preset/graded 均为仓库内普通目录，内容直接入库）；
 > graded 发布物：`graded/dsh-external-dsh-graded-mode-0.0.1-rc1.tgz`（或 Release 附件）。
 
-**DSH Target**：`>=0.1.0-rc.6 <0.2.0`（已跟进 rc.8 / 0.1.1-rc.2 / 0.1.2-alpha.1）
+**DSH Target**：`>=0.1.0-rc.6`（已跟进 rc.8 / 0.1.1-rc.2 / 0.1.2-alpha.1，并在
+**0.2.1-rc.2** 上完成 macOS 实测与兼容修复——见 [docs/COMPAT.md](docs/COMPAT.md)）
 
 > DSH 目前处于 developer preview，官方明示会有破坏性变更（breaking changes）。
-> 本仓库的版本跟进记录见 `preset/CHANGELOG.md`。
+> 本仓库的版本跟进记录见 `preset/CHANGELOG.md` 与 [docs/COMPAT.md](docs/COMPAT.md)。
 
 ## 安装链（三步）
 
-```powershell
+```bash
 # 1. 拉套装（单仓库：injector/preset 内容已直接入库，无需 submodule）
 git clone https://github.com/yjh051108/dsh-routing-suite.git
 cd dsh-routing-suite
 
 # 2. 一键安装（注入器装配 + 预设复制 + 布局自检 + 提示重启）
-.\install.ps1
+bash install.sh        # macOS / Linux
+.\install.ps1          # Windows（PowerShell）
 ```
 
-或手动：
+或手动（macOS/Linux 以 `~/.dsh` 为例；Windows 把 `~` 换成 `$env:USERPROFILE`、`/` 换成 `\`）：
 
-```powershell
+```bash
 # 步骤 1：装配注入器（官方装配，重启后由 bundles 接管）
-dsh plugin --profile web add .\injector
-# dsh 不在 PATH 时：npx '@deepseek-ai/dsh' plugin --profile web add .\injector
+dsh plugin --profile web add ./injector
+# dsh 不在 PATH 时：npx '@deepseek-ai/dsh' plugin --profile web add ./injector
 
 # 步骤 2：安装 router 预设（每个预设目录平铺复制到 .agent-presets 下，DSH 只扫一级子目录）
-$target = Join-Path $env:USERPROFILE '.dsh\.agent-presets\router-standard'
-Copy-Item -Recurse .\preset\router-standard $target
-
-$target = Join-Path $env:USERPROFILE '.dsh\.agent-presets\router-spec'
-Copy-Item -Recurse .\preset\router-spec $target
+mkdir -p ~/.dsh/.agent-presets
+cp -R preset/router-standard ~/.dsh/.agent-presets/router-standard
+cp -R preset/router-spec ~/.dsh/.agent-presets/router-spec
 
 # 步骤 3：重启 DSH → 新会话选择 Router Standard / Router Spec (experimental)
 ```
 
 > 注意：不要复制 `preset` 整目录（会多套一层，DSH 发现不了预设）。
+> macOS/Linux 的已知兼容点与验证方式见 [docs/COMPAT.md](docs/COMPAT.md)。
 
 ## 组件
 
 | 路径 | 仓库 | 版本 | 作用 |
 |---|---|---|---|
-| `injector/` | [dsh-super-injector](https://github.com/yjh051108/dsh-super-injector) | [v0.3.3](https://github.com/yjh051108/dsh-super-injector/releases/tag/v0.3.3) | 运行时注入器：dev_* 工具全家桶（注入/热重载/侧挂转正/卸载/路由自愈）；`github:` 装配由 prepare 钩子自动构建 |
-| `preset/` | [dsh-router-standard](https://github.com/yjh051108/dsh-router-standard) | [v0.3.0 … 主线 v1.19.1/v34](https://github.com/yjh051108/dsh-router-standard/releases/tag/v0.3.0) | 思维模式路由预设：router-standard（分类 persona + 完整 sections）/ router-spec（深度思考优先）。router-pro 为规划中（planned），未随 v0.3.0 发布 |
+| `injector/` | [dsh-super-injector](https://github.com/yjh051108/dsh-super-injector) | 主线 v0.3.6（最新 Release [v0.3.5](https://github.com/yjh051108/dsh-super-injector/releases/tag/v0.3.5)） | 运行时注入器：dev_* 工具全家桶（注入/热重载/侧挂转正/卸载/路由自愈）；`github:` 装配由 prepare 钩子自动构建；0.3.6 修 DSH 0.2.x 的 profile 推导 / `loader.internal` 缺失 |
+| `preset/` | [dsh-router-standard](https://github.com/yjh051108/dsh-router-standard) | [v0.3.0 … 主线 v1.27/v34](https://github.com/yjh051108/dsh-router-standard/releases/tag/v0.3.0) | 思维模式路由预设：router-standard（分类 persona + 完整 sections）/ router-spec（深度思考优先）。router-pro 为规划中（planned），未随 v0.3.0 发布 |
 | `graded/` | [dsh-graded-mode](https://github.com/yjh051108/dsh-routing-suite/tree/main/graded) | [v0.0.1-rc1](https://github.com/yjh051108/dsh-routing-suite/releases/tag/v0.0.1-rc1) | graded 模式：会话级两级任务协议（脑暴选择题对齐 → 北极星定稿 → 规格化计划 → 按规格注入 → 打卡制 → 组收官 → 终验）；6 工具 + 三模式 + 小类模式粒度 + 红队门 + 审计端点；`graded/dsh-graded-mode-3.2.0.tgz` 可直接 `dsh plugin --profile web add` |
 
 > 版本号以各组件仓库的 git tag 为准（列内链接直达对应 Release）。
@@ -98,6 +111,7 @@ Copy-Item -Recurse .\preset\router-spec $target
 - 注入器引导（规范铁律 10 条）：`injector/README.md`
 - 路由预设论文与实验：`preset/docs/paper.md` + `preset/docs/experiments.md`（P1-P23）
 - 仓库结构迁移（submodule → 直接文件）：[docs/FLATTEN-MIGRATION.md](docs/FLATTEN-MIGRATION.md)
+- DSH 版本兼容（0.2.1-rc.2）与 macOS 兼容点：[docs/COMPAT.md](docs/COMPAT.md)
 
 ## 许可证
 

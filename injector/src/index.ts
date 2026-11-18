@@ -27,11 +27,15 @@ import type SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import type ToolRegistry from '@deepseek-ai/dsh-tools'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import z from '@deepseek-ai/schemastery'
-import { readdirSync, statSync, readFileSync, writeFileSync, existsSync, mkdirSync, symlinkSync, rmdirSync, appendFileSync, renameSync, lstatSync, rmSync, readlinkSync, realpathSync } from 'node:fs'
-import { join, relative, dirname, resolve } from 'node:path'
+import { readdirSync, statSync, readFileSync, writeFileSync, existsSync, mkdirSync, symlinkSync, rmdirSync, appendFileSync, renameSync, lstatSync, rmSync, readlinkSync, realpathSync, copyFileSync } from 'node:fs'
+import { join, relative, dirname, resolve, basename } from 'node:path'
 import { homedir } from 'node:os'
 import { spawnSync } from 'node:child_process'
 import { pathToFileURL, fileURLToPath } from 'node:url'
+// ⚠️ 命名空间导入（**不是** `import { registerHooks }`）—— 后者在低版本 Node 上
+//   会于 **ESM 链接期**直接抛 SyntaxError（"does not provide an export named"），
+//   整个插件连加载都失败。命名空间导入不会，缺失时取到 undefined，可优雅降级。
+import * as nodeModuleApi from 'node:module'
 
 // ═══════════════════════════════════════════════════════════════════════
 // A: 插件生产线模板（dev_scaffold_plugin）——四种形态骨架：
@@ -67,7 +71,15 @@ if [ ! -x "$TSC" ] && [ ! -f "$TSC.cmd" ]; then
   exit 1
 fi
 
-link_pkg() {
+# ⚠️ 依赖物化用 **copy**，绝不用 junction（2026-10-15 定案）。
+# 事故链：本目录是**一次性临时构建目录**，构建/清理时会整体 rmSync；而目录里
+# 若是 junction，Windows + Node 在递归删除时可能跟随链接、把**链接目标的真实
+# 内容**删空 —— 实测两个 checkout（dsh-harness 与隔离 checkout）里同一组
+# link_pkg 目标全部 items=0，而非 link_pkg 目标的同级包完好无损（1:1 对应）。
+# copy 之后源目录只在读取侧被访问，物理上不可能被本脚本写坏 —— 依赖源的安全
+# 不再依赖"Node 递归删除是否会跟随链接"这一未定义行为。
+# 代价：每次构建多几 MB 复制（实测 <1s），换依赖永不被掏空，值得。
+use_pkg() {
   local target="$CHECKOUT/$2"
   if [ ! -e "$target" ]; then
     echo "build: dependency target missing: $target" >&2
@@ -76,19 +88,31 @@ link_pkg() {
   node -e "
     const fs = require('fs');
     const path = require('path');
-    const link = path.resolve(process.argv[1]);
-    const target = path.resolve(process.argv[2]);
-    fs.rmSync(link, { recursive: true, force: true });
-    fs.mkdirSync(path.dirname(link), { recursive: true });
-    fs.symlinkSync(target, link, process.platform === 'win32' ? 'junction' : 'dir');
+    const dst = path.resolve(process.argv[1]);
+    const src = path.resolve(process.argv[2]);
+    // 清掉旧的 dst（可能是历史遗留的 junction —— 同样只用 rmdir，绝不递归进目标）
+    try {
+      const st = fs.lstatSync(dst);
+      if (st.isSymbolicLink()) fs.rmdirSync(dst);
+      else fs.rmSync(dst, { recursive: true, force: true });
+    } catch { /* 不存在则无需删除 */ }
+    fs.mkdirSync(path.dirname(dst), { recursive: true });
+    // 递归复制，跳过嵌套 node_modules（保持体积可控、且不引入第二份依赖树）
+    fs.cpSync(src, dst, {
+      recursive: true,
+      dereference: false,
+      filter: (s) => path.basename(s) !== 'node_modules',
+    });
   " "node_modules/$1" "$target"
 }
+# 兼容旧名（模板历史引用）
+link_pkg() { use_pkg "$@"; }
 
 echo "=== Linking build dependencies (checkout: $CHECKOUT) ==="
 mkdir -p node_modules/@deepseek-ai
 node -e "const fs=require('fs');fs.rmSync('node_modules/@standard-schema',{recursive:true,force:true})"
 link_pkg @deepseek-ai/cordis vendor/cordis
-link_pkg @deepseek-ai/cosmokit vendor/cosmokit
+link_pkg cosmokit vendor/cosmokit
 link_pkg @deepseek-ai/schemastery vendor/schemastery
 link_pkg @deepseek-ai/dsh-tools packages/core/tools
 link_pkg @deepseek-ai/dsh-llm packages/llm/llm
@@ -403,7 +427,7 @@ const PLUGIN_ID = ${JSON.stringify(pkgName)}
 
 const CLIENT_EXTERNALS = [
   'react', 'react/jsx-runtime', 'react-dom', 'react-dom/client',
-  'cordis',
+  '@deepseek-ai/cordis',
   '@deepseek-ai/dsh-client-ui-slots',
   '@deepseek-ai/dsh-client-runtime/client',
 ]
@@ -441,7 +465,7 @@ function scaffoldPackageJson(pkgName: string, description: string, form: string)
   const peerDeps: Record<string, string> = {
     '@deepseek-ai/dsh-llm': '>=0.0.1-rc <2',
     '@deepseek-ai/dsh-tools': '>=0.0.1-rc <2',
-    'cordis': '>=4.0.0-rc <5',
+    '@deepseek-ai/cordis': '>=4.0.0-rc <5',
     '@deepseek-ai/schemastery': '^3.18.2',
   }
   if (withClient) {
@@ -556,25 +580,242 @@ function fingerprintOf(dir: string): string | null {
   }
 }
 
+/** 定时 resolve（unref：不为了等计时拖住进程退出）。 */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const t = globalThis.setTimeout(resolve, ms)
+    ;(t as any)?.unref?.()
+  })
+}
+
 /**
  * 操作互斥锁：注入/卸载/重载/安装全部串行执行（多会话并发调用注入器时，
  * 后操作排队等前操作完成——避免同一插件被并发重载/卸载的竞态）。
+ *
+ * 防毒化（案底 2026-09-07 挂死轮）：一次卡死的操作不能把后续所有注入/卸载
+ * 永久排队——链的推进最多等 OP_HOLD_MAX_MS，操作自身的超时接管负责诚实上报。
  */
 let opChain: Promise<unknown> = Promise.resolve()
+const OP_HOLD_MAX_MS = 30_000
 function withOpLock<T>(fn: () => Promise<T> | T): Promise<T> {
   const run = opChain.then(() => fn(), () => fn())
-  opChain = run.then(() => undefined, () => undefined)
+  opChain = Promise.race([run.then(() => undefined, () => undefined), sleep(OP_HOLD_MAX_MS)])
   return run
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 模块缓存「代次」—— 修复热重载只换入口、不换依赖模块（**混合代**）
+ *
+ * ══ 病案（2026-10-17 实测，最小复现 + 真机双向验证）══════════════════════════
+ *
+ * 症状：`dev_reload_package` 报「重载完成」，但运行中的插件**半新半旧**：
+ *   · 入口 `lib/index.js` 里的改动生效了（`live_certify` 判「未被建立」= 新行为）
+ *   · 依赖 `lib/clayer.js` 里的改动**没生效**（`live_revoke` 仍"波及 1 项"= 旧行为）
+ *
+ * 根因（**Node ESM 规格行为，不是谁写错一行**）：
+ *   旧实现给入口加 `?v=<时间戳>` 让 loader 视为新 specifier —— 但
+ *   `index.js` 内部的 `import './clayer.js'` 是**相对说明符且无 query**
+ *   ⇒ 解析成**无参数的原 URL** ⇒ 命中 Node 自己的 ESM 模块注册表 ⇒ 返回旧代。
+ *
+ * 最小复现（实测，非推理）：
+ *   ```
+ *   import(index.js?v=1) → dep.V = 'A'
+ *   （磁盘 dep.js 改成 'B'）
+ *   import(index.js?v=2) → dep.V = 'A'   ← 依赖命中旧缓存
+ *   ```
+ *
+ * ⚠️ 为什么既有 `purgeCache` 兜不住：
+ *   它删的是 **cordis 的 loadCache**（入口表），而相对 import 走的是
+ *   **Node 自己的模块注册表** —— 两个缓存不是一个东西。
+ *   且宿主未开 `--expose-internals` ⇒ `loader.internal` 恒为 undefined
+ *   ⇒ purge 是 no-op（文件里 :1057 已记此事）⇒ 只剩 cache-busting 兜底。
+ *
+ * ══ 修法：给**整棵依赖树**按代次加戳（`module.registerHooks`）═══════════════
+ *
+ * 在 `resolve` 钩子里，把**目标包目录下**的所有 file: URL 都附上当前代次：
+ *   · 首次加载 = gen 1；每次重载前 `bumpGeneration(dir)` → gen+1
+ *   · 相对说明符（`./clayer.js`）由 Node 解析成绝对 URL **之后**才进钩子
+ *     ⇒ 钩子看到的已是绝对路径 ⇒ 能按目录判定、能加戳
+ *   · 于是 `clayer.js?v=2` ≠ `clayer.js?v=1` ⇒ 整棵树重读
+ *
+ * ⚠️ 实测边界（都验过，不是假设）：
+ *   · Node v24.13 与 **Electron 44（Node 24.18.1）都支持** `module.registerHooks`
+ *   · 对**动态 `import()`** 有效（`ctx.loader.import` 正是它）—— 实测通过
+ *   · hook 是**进程级**的：只加戳"在钩子注册后加载"的模块，已有的不动
+ *   · 不支持时**优雅降级**回旧行为（只换入口），并如实 warn —— 不假装修好了
+ *
+ * ⚠️ 本机制**不碰** cordis 的 loadCache/loader.internal：与既有 purge 正交，
+ *   两者都跑不冲突（purge 管入口表，本钩子管依赖树）。
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/** 目录(realpath, 正斜杠) → 当前代次。缺省 = 1（首次加载的代次）。 */
+/**
+ * 装上代次钩子（**幂等**：重复调用只有第一次生效）。
+ * 返回是否可用 —— 调用方可据此如实上报"降级"。
+ *
+ * ══ 🔴 v0.3.6b 修（真机实测：我的修复自己被模块缓存吃掉了）══════════════════
+ * 病案（`self-heal.log` 可核）：加钩子后重载注入器，**预测** 2 分钟后出现
+ *   `watch-dangling-gone`；**实测 3 分钟过去 gone=0，仍在每 30s 刷**。
+ * 根因：`moduleGeneration` 原本是**模块级** `new Map()` ⇒ 自重载后模块实例全新
+ *   ⇒ Map 空 ⇒ 钩子对任何 URL 算出 gen=1 ⇒ **永远不加戳** ⇒ 仍是旧代码。
+ * ⚠️ 讽刺：我修的是「模块缓存导致混合代」，而**我的修复自己被模块缓存吃掉**。
+ * ⇒ 修法：状态移到 **globalThis**（进程级，重载后仍活着）—— 见 watch-dangle.ts。
+ */
+function installGenerationHook(log: { warn: (s: string) => void }): boolean {
+  const st = genState()
+  if (st.installed) return true
+  const registerHooks = (nodeModuleApi as { registerHooks?: unknown }).registerHooks
+  if (typeof registerHooks !== 'function') {
+    st.reason = 'node:module 无 registerHooks（需 Node ≥22.15 / ≥23.5）⇒ 降级为只换入口'
+    log.warn('[super-injector] ' + st.reason)
+    return false
+  }
+  try {
+    ;(registerHooks as (h: unknown) => void)({
+      // ⚠️ 只实现 `resolve` —— 不碰 load/format，避免干扰正常加载语义。
+      //   逻辑体是**纯函数** `applyGeneration`（在 watch-dangle.ts，有测试覆盖）。
+      resolve(specifier: string, context: unknown, nextResolve: (s: string, c?: unknown) => { url?: string }) {
+        const result = nextResolve(specifier, context)
+        try {
+          const url = result?.url
+          if (typeof url !== 'string') return result
+          const next = applyGeneration(url)
+          return next === url ? result : { ...result, url: next }
+        } catch { return result }              // 任何异常都不阻断解析
+      },
+    })
+    st.installed = true
+    st.reason = 'ok'
+    return true
+  } catch (e) {
+    st.reason = 'registerHooks 抛错 ⇒ 降级为只换入口：' + (e instanceof Error ? e.message : String(e))
+    log.warn('[super-injector] ' + st.reason)
+    return false
+  }
+}
+
+
+/** 只读：当前代次（诊断用）。**进程级**，重载后仍在。 */
+function generationSnapshot(): { dir: string; gen: number }[] {
+  return [...genState().generations.entries()].map(([d, g]) => ({ dir: d, gen: g }))
+}
+
+/** 只读：钩子状态（供诊断工具如实上报：装了没有、为什么没装）。 */
+function generationHookStatus(): { installed: boolean; reason: string; dirs: number } {
+  const st = genState()
+  return { installed: st.installed, reason: st.reason, dirs: st.generations.size }
+}
+
+/**
+ * 自愈路径要 bump 哪些目录。
+ *
+ * ⚠️ 为什么**两个都要**（junction 路径 + realpath）：
+ *   Node 的 ESM 解析会把 junction 折叠成 **realpath** —— 钩子拿到的 URL 是 realpath 形式。
+ *   而配置里写的、`existsSync` 判的常是 **junction 路径**。
+ *   ⇒ 只 bump 其中一个，代次就可能**落在钩子看不到的键上** ⇒ 白 bump。
+ *   （这正是本项目"两个口算同一个数"的同族：**一个概念两个表示，必须都覆盖**。）
+ *
+ * @param profileNodeModules 当前 profile 的 node_modules（由 apply 里推导，故作参数传入）
+ */
+function healBumpDirs(pkgName: string, profileNodeModules: string): string[] {
+  const out: string[] = []
+  const parts = pkgName.startsWith('@') ? pkgName.split('/') : [pkgName]
+  const junction = join(profileNodeModules, ...parts)
+  out.push(junction)
+  try {
+    const real = realpathSync(junction)
+    if (real && real !== junction) out.push(real)
+  } catch { /* 解析不了就只用 junction 形式 */ }
+  return out
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 悬空目录的「放弃」决策 —— 已抽到 `./watch-dangle.ts`
+ *
+ * ══ 为什么抽走（真机 bug：日志被刷 4738 行）═════════════════════════════════════
+ *   病案：`self-heal.log` 4916 行里 **4738 行**是同一条 `watch-dangling`，
+ *   刷的是一个**早就删掉**的目录 —— 每 30 秒一条，**每天 ~2880 行，永不收敛**。
+ *
+ *   根因：原来的 30s 节流是「**限速**」不是「**放弃**」——
+ *     它假设目录**迟早会回来**。对"永久消失"（源被删/移走）这种情况**不收敛**。
+ *   ⚠️ 判据：**"暂时"与"永久"必须用「次数」区分** —— 只靠时间间隔区分不了
+ *     （同一个 30s 间隔，既可能是"正在 build"，也可能是"已经删了三天"）。
+ *
+ *   ⚠️ 为什么**移到独立文件**而不是留在本文件里：
+ *     留在本文件 ⇒ 测试要 import 它就得 import 整个插件
+ *     ⇒ 需宿主 peer 依赖 ⇒ **测不了** ⇒ 又回到"没人测"。
+ *     抽到零依赖模块后，测试能直接 import **真身**（不是复刻一份 —— 复刻必然漂移）。
+ * =========================================================================== */
+import { dangleDecision, DANGLE_GONE_AFTER_MS, genState, bumpDir, applyGeneration, type DangleState } from './watch-dangle.js'
+
 export function apply(ctx: AppContext, config: Config): void {
   const logger = ctx.logger
+  // ═══ 装上「模块代次」钩子（幂等，装不上则优雅降级）═══════════════════════════
+  // 这是修「热重载只换入口、不换依赖模块」的核心（见上方长注释）。
+  // ⚠️ 必须在**任何重载发生之前**装 —— 放 apply 开头，插件一加载就位。
+  // ⚠️ 返回值如实上报：装不上就明说降级（不假装修好了）——
+  //    这正是本项目在 live-prompt 里那条"读数必须真实"的同一条纪律。
+  const genHookOk = installGenerationHook(logger)
+  if (genHookOk) {
+    logger.info('[super-injector] 模块代次钩子已装：重载会重读**整棵依赖树**（不再混合代）')
+  }
   // ⚠️ DSH_HOME 优先（实测踩坑）：部署的 web 进程 homedir 可能与 DSH_HOME 指向
   // 不同用户（如服务账户/另一用户 profile），homedir() 推导的路径会全部错位——
   // junction 建到错误 profile、loader 找不到包。DSH_HOME 环境变量才是权威。
   const dshHome = process.env.DSH_HOME || join(homedir(), '.dsh')
   const registryFile = config.registryFile || join(dshHome, 'super-injector', 'registry.json')
-  const profileNodeModules = config.profileNodeModules || join(dshHome, 'profiles', 'web', 'node_modules')
+  // ═══ 当前 profile 的推导（实测踩坑 2026-10-15，缺陷 A）═══
+  // 旧实现把 profile 名**硬编码成 'web'**（join(dshHome,'profiles','web','node_modules')），
+  // 而 Desktop 实际跑的是 `desktop` profile ⇒ junction 全建到 web profile，
+  // 当前进程的 loader 根本看不到 ⇒ dev_inject_plugin 永远报 `host ✗`。
+  // 决定性证据：同一插件同一条命令，手工在 desktop profile 建好 junction 后
+  // host ✗ → host ✓、entry 转 ACTIVE。
+  // ⚠️ 宿主进程里**没有** DSH_PROFILE / DSH_PROFILE_DIR（实测均为 null），
+  // 所以权威来源是 **ctx.baseUrl**（loader 按 profile 目录设置的根 URL）：
+  //   file:///C:/Users/<u>/.dsh/profiles/desktop/
+  // 推导顺序：显式 config → ctx.baseUrl → DSH_PROFILE_DIR → DSH_PROFILE → 'web' 兜底。
+  function deriveProfileNodeModules(): { dir: string; via: string } {
+    const explicit = config.profileNodeModules
+    if (explicit) return { dir: explicit, via: 'config.profileNodeModules' }
+    // ① ctx.baseUrl（最权威：loader 自己就按它解析）
+    try {
+      const base = (ctx as { baseUrl?: string }).baseUrl
+      if (base && base.startsWith('file:')) {
+        const dir = fileURLToPath(base)
+        // 仅接受 …/profiles/<name>/ 形态，避免 baseUrl 指向别处时误判
+        if (/[\\/]profiles[\\/][^\\/]+[\\/]?$/.test(dir)) {
+          return { dir: join(dir, 'node_modules'), via: 'ctx.baseUrl=' + base }
+        }
+      }
+    } catch { /* 推导失败继续下一条 */ }
+    // ② DSH_PROFILE_DIR（若将来宿主补上该变量）
+    const profileDir = process.env.DSH_PROFILE_DIR
+    if (profileDir) return { dir: join(profileDir, 'node_modules'), via: 'DSH_PROFILE_DIR' }
+    // ③ DSH_PROFILE
+    const profileName = process.env.DSH_PROFILE
+    if (profileName) return { dir: join(dshHome, 'profiles', profileName, 'node_modules'), via: 'DSH_PROFILE=' + profileName }
+    // ④ 兜底：唯一存在的 profile 目录只此一个时直接用它（多 profile 时仍回落 web）
+    try {
+      const names = readdirSync(join(dshHome, 'profiles'), { withFileTypes: true })
+        .filter((d) => d.isDirectory()).map((d) => d.name)
+      if (names.length === 1) return { dir: join(dshHome, 'profiles', names[0], 'node_modules'), via: '唯一 profile=' + names[0] }
+    } catch { /* 读目录失败走兜底 */ }
+    return { dir: join(dshHome, 'profiles', 'web', 'node_modules'), via: 'fallback web' }
+  }
+  const _profile = deriveProfileNodeModules()
+  const profileNodeModules = _profile.dir
+  logger.info('[super-injector] profile 解析: %s（via %s）', profileNodeModules, _profile.via)
+
+  /** 当前 profile 的**名字**（从已推导的 node_modules 路径取上级目录名）。
+   * 供 dev_install_package 之类"缺省操作哪个 profile"的调用点使用——
+   * 避免各处再写死 'web'（缺陷 A 同族）。 */
+  function currentProfileName(): string {
+    try {
+      return basename(dirname(profileNodeModules)) || 'web'
+    } catch {
+      return 'web'
+    }
+  }
   // 热重载的 config 合并路径可能缺 schema 新字段（旧 fiber _config + patch 旧值），
   // 防御性兜底（schema 默认值只在 loader 装配时保证）。
   const intervalMs = config.intervalMs ?? 1500
@@ -701,6 +942,37 @@ export function apply(ctx: AppContext, config: Config): void {
     } catch { /* 审计写失败不阻塞 */ }
   }
 
+  // ═══ 未处理 rejection 常驻兜底（2026-09-12 崩溃循环案底）═══
+  // 案底：后侧工具里一个**未被 await 的 rejection** 逃出工具栈 → Node 默认把它升级成
+  // 未捕获异常 → 宿主 `dsh: fatal load failure` 退出 code=1 → 桌面壳无条件重启 → 崩溃循环，
+  // 用户体感「DSH 反反复复重启」。两次实测同型：SessionQueryError（本部署 session-query
+  // 配成 openAt:"never"，搜索被禁用）、以及负对照里故意造的 Promise.reject。
+  // ⚠️ 第一版修法（只在 dev_stage_call 的调用窗口内挂监听）**被负对照当场打红**：
+  //    unhandledRejection 是在微任务队列**排空之后**才上报的，`finally` 摘监听时它还没上报，
+  //    窗口一关等于没挂。故改为**常驻**：整个进程生命周期挂住，逃逸一律降级成日志 + 计数，
+  //    绝不升级成宿主退出。
+  // 代价（诚实标注）：宿主范围内任何 unhandledRejection 都不再崩进程 —— 会掩盖别处的 bug。
+  // 缓解：每次逃逸都落 self-heal.log，可审计、不静默。用 Symbol.for + globalThis 存状态，
+  // 热重载不会重复挂监听（否则每重载一次就多叠一层）。
+  try {
+    const SHIELD = Symbol.for('dsh.super-injector.rejection-shield')
+    const g = globalThis as unknown as Record<symbol, { count: number; handler: (reason: unknown) => void } | undefined>
+    if (!g[SHIELD]) {
+      const state = { count: 0, handler: (_reason: unknown): void => { /* 占位，下面立刻覆写 */ } }
+      state.handler = (reason: unknown): void => {
+        state.count += 1
+        const text = reason instanceof Error ? (reason.stack ?? reason.message) : String(reason)
+        auditLog('escaped-rejection', `#${state.count} ${String(text).slice(0, 400)}`)
+        try {
+          logger.warn('[super-injector] 未处理 rejection 已降级（宿主未退出）: %s', String(text).slice(0, 200))
+        } catch { /* 日志失败不阻断 */ }
+      }
+      process.on('unhandledRejection', state.handler)
+      g[SHIELD] = state
+      auditLog('rejection-shield', '常驻兜底已安装（unhandledRejection 不再导致宿主退出）')
+    }
+  } catch { /* 兜底安装失败不阻断插件 */ }
+
   /** 日志轮转（D）：超限后滚动 .1/.2，保留 2 代，防长期运行无限增长。 */
   function rotateLog(file: string): void {
     try {
@@ -821,6 +1093,22 @@ export function apply(ctx: AppContext, config: Config): void {
             if (attempt <= 3) {
               try {
                 mkdirSync(dirname(patchFile), { recursive: true })
+                // ══ 🔴 v0.3.6b：**heal 路径也要 bump 代次** ══════════════════════════
+                // 病案（真机实测，我自己的修复在这里失效）：
+                //   `reboot-failed`（selfEntry 无 _dispose）⇒ 落到这条 heal 路径
+                //   ⇒ touch patch 让 include.refresh 重新装配 ⇒ loader 用**同一个
+                //   入口 URL** 再 import 一次 ⇒ 命中 Node 的 ESM 注册表 ⇒ **旧代码**。
+                //   而 `reloadPackage` 开头那次 bump 只影响"我自己 import 的 URL"，
+                //   影响不到 include.refresh 内部怎么解析。
+                //   ⇒ 实测：预测 2 分钟后出现 `watch-dangling-gone`；3 分钟过去 gone=0，
+                //     仍在每 30s 刷屏 —— **预测被推翻**，才追到这里。
+                // ⚠️ 判据：**"在 A 处 bump" 不等于 "B 路径也会加戳"** ——
+                //   凡是"重新 import"的地方都是独立入口，各有各的 URL 解析。
+                try {
+                  for (const pkgDir of healBumpDirs(pkgName, profileNodeModules)) {
+                    if (existsSync(pkgDir)) auditLog('gen-bump', `heal 前代次 → v${bumpDir(pkgDir)}（${pkgDir}）`)
+                  }
+                } catch { /* 代次失败不影响自愈 */ }
                 appendFileSync(patchFile, `\n# super-injector heal ${Date.now()}\n`)
                 // 给 include.refresh 一个窗口，然后验证官方 entry 是否复活
                 await new Promise((r) => globalThis.setTimeout(r, 3000))
@@ -879,10 +1167,101 @@ export function apply(ctx: AppContext, config: Config): void {
     }
   }
 
+  // ═══ 有界交接（防挂死安全网，2026-09-07 挂死案底轮）═══
+  /** 工具栈内允许等一次交换的时间；到点转后台继续，绝不拖死宿主。 */
+  const HANDOFF_MS = 6000
+  /** 后台收口账本（dev_plugin_status 公示——异步化不丢可观测性，不静默）。 */
+  const bgOps = new Map<string, { at: number; kind: string; state: string; detail: string }>()
+
+  /**
+   * 有界交接：工具调用栈内最多等 ms，到点不傻等——**同一个**操作继续在后台收口
+   * （不重复触发），结果写 bgOps + self-heal.log。
+   *
+   * 案底（开发者两次指出「reload 有问题会导致卡死」）：普通重载分支在工具栈里
+   * `await 目标 fiber.dispose()`，宿主整个挂死、只能重启。机制与本文件自重载处
+   * 既有结论同源（见「v0.3 最终形态：工具只排程、绝不亲自自杀」）：本次工具调用
+   * 占着 dsh-tools 调度槽，而 dispose 要等依赖该服务的 fiber 生命周期走完——互相
+   * 等待成环。自重载早已分离式重启器，普通重载漏了同一课。
+   * 纪律：任何「等别的 fiber 生命周期」的 await 都必须能被超时接管。
+   */
+  function handoff(kind: string, key: string, ms: number, task: () => Promise<string>): Promise<string> {
+    let settled = false
+    const note = (state: string, detail: string): void => {
+      bgOps.set(key, { at: Date.now(), kind, state, detail: detail.slice(0, 400) })
+      try {
+        auditLog(`${kind}-${state}`, `${key}: ${detail.slice(0, 200)}`)
+      } catch { /* 审计写失败不阻塞 */ }
+    }
+    const carry = (async () => task())().then(
+      (text) => ({ failed: false, text }),
+      (e: unknown) => ({ failed: true, text: 'ERROR: ' + (e instanceof Error ? (e.stack ?? e.message) : String(e)) }),
+    )
+    void carry.then((r) => { if (settled) note(r.failed ? 'bg-failed' : 'bg-done', r.text) })
+    return new Promise<string>((resolve) => {
+      const timer = globalThis.setTimeout(() => {
+        if (settled) return
+        settled = true
+        note('running', `超 ${ms}ms 未收口，转后台继续`)
+        resolve(
+          `WARN: ${kind} ${key} 未在 ${ms}ms 内收口（工具栈内等 fiber 生命周期有环风险——案底挂死轮），`
+          + '同一操作已转后台继续（未重复触发）。用 dev_plugin_status 看「后台操作」确认收口；'
+          + '若长期停在 running，说明旧代释放确实卡住，需重启宿主。',
+        )
+      }, ms)
+      ;(timer as any)?.unref?.()
+      void carry.then((r) => {
+        if (settled) return
+        settled = true
+        globalThis.clearTimeout(timer)
+        resolve(r.text)
+      })
+    })
+  }
+
   async function reloadPackage(match: string, urlMatch?: string): Promise<string> {
+    // ═══ 代次 +1（**必须在任何 import 之前**）══════════════════════════════════
+    // 见上方「模块缓存代次」长注释：只给入口加 ?v= 不足以换掉依赖模块，
+    // 相对 import（`./clayer.js`）仍会命中 Node 的 ESM 注册表 ⇒ 混合代。
+    // 这里把**目标包目录**的代次 +1，钩子会给该目录下**整棵依赖树**的 URL 加戳。
+    //
+    // ⚠️ 放在 `reloadPackage` 的**最开头**，而不是各调用点 —— 因为重载有多条
+    //   路径（工具 / 自重载 / watch 自动 / handoff 转后台），**一处覆盖四条**。
+    //   （本项目已栽过"只修一个口"5 次，故此处刻意选唯一收口点。）
+    // ⚠️ 失败不阻断：代次只是"锦上添花"，装不上就退回旧行为（只换入口）。
+    try {
+      const dirs: string[] = []
+      if (urlMatch) dirs.push(urlMatch)
+      try {
+        const entry = findEntry(match)
+        const nm = entry?.options?.name
+        if (nm) {
+          const parts = nm.startsWith('@') ? nm.split('/') : [nm]
+          dirs.push(join(profileNodeModules, ...parts))
+        }
+      } catch { /* findEntry 失败 ⇒ 只用 urlMatch */ }
+      for (const d of dirs) {
+        if (!d || !existsSync(d)) continue
+        const gen = bumpDir(d)   // ⚠️ 进程级（globalThis）—— 见 watch-dangle.ts 的 v0.3.6b 注释
+        auditLog('gen-bump', `模块代次 → v${gen}（${d}）`)
+      }
+    } catch { /* 代次失效不影响重载主流程 */ }
+
     const internal = ctx.loader.internal
-    if (!internal) return 'ERROR: loader.internal 不可用'
-    const loadCache = internal.loadCache as Map<string, any>
+    // ⚠️ 实测（2026-10-15，缺陷 B）：宿主未以 --expose-internals 启动 ⇒
+    // loader 1.0.5 的 ModuleLoader.fromInternal() 返回 undefined（实测 execArgv=[]）
+    // ⇒ ctx.loader.internal **恒为 undefined**。旧实现在此直接 return 错误，
+    // 于是热重载/自重载/预检全线不可用 —— 连「自重载自修复」这条唯一能免重启
+    // 修自己的路都被堵死（必须重启宿主）。
+    // 降级：用空 Map 替身（purge/backup/restore 全部退化为 no-op），改靠
+    // cache-busting query 强制重读磁盘（loader.import 本身在 internal 缺失时
+    // 回落原生 import，见 loader lib/index.js:214-227）。
+    const liveCache = internal?.loadCache as Map<string, any> | undefined
+    const noCache = !liveCache || typeof liveCache.keys !== 'function'
+    if (noCache) {
+      logger.warn('[super-injector] loader.internal 不可用（宿主未开 --expose-internals）'
+        + '——重载走无缓存降级路径（cache-busting import）')
+    }
+    const loadCache = (liveCache ?? new Map<string, any>()) as Map<string, any>
 
     const urlKey = (urlMatch ?? match).replace(/\\/g, '/')
     let urls = [...loadCache.keys()].filter((u) => {
@@ -898,6 +1277,11 @@ export function apply(ctx: AppContext, config: Config): void {
     // 包名——按 urlKey（包名）重新匹配会失败。realpathSync(lib) 与 loadCache
     // 的真实 key（realpath URL）一致。
     let entryUrl: string | undefined
+    // ⚠️ 无缓存降级（缺陷 B）：urls 必然为空（拿不到 loadCache 的 key），
+    // 且下面 import 后的「按 real 路径回扫 loadCache」也拿不到 key ⇒ 必须
+    // 直接用**磁盘 realpath URL 的 cache-busting 形式**当 entryUrl。
+    // ?v=<时间戳> 让原生 import 视为新 specifier → 强制重读磁盘文件（不撞
+    // 模块缓存），这正是热重载「重读新代码」的语义。
     if (urls.length === 0) {
       let libPath: string | undefined
       try {
@@ -918,11 +1302,15 @@ export function apply(ctx: AppContext, config: Config): void {
           // 命中旧模块缓存，loadCache 不产生新 key → 匹配仍失败。realpath URL
           // 是全新 key，强制重新解析磁盘并填充缓存。
           const realLib = realpathSync(libPath)
-          await ctx.loader.import(pathToFileURL(realLib).href, () => [])
+          const bust = pathToFileURL(realLib).href + '?v=' + Date.now()
+          await ctx.loader.import(bust, () => [])
           const real = realLib.replace(/\\/g, '/')
           for (const u of loadCache.keys()) {
             if (typeof u === 'string' && decodeURIComponent(u).includes(real)) { entryUrl = u; break }
           }
+          // 无 loadCache 时（noCache）回扫必然为空 —— 用 cache-busting URL 兜底，
+          // 否则本函数会以「磁盘降级失败」退出，重载再次不可用。
+          if (!entryUrl && noCache) { entryUrl = bust }
         }
       } catch { /* 降级失败继续走下面判断 */ }
       if (entryUrl) {
@@ -1160,33 +1548,37 @@ export function apply(ctx: AppContext, config: Config): void {
         backup.set(u, loadCache.get(u))
         Map.prototype.delete.call(loadCache, u)
       }
+      let fresh: any
       try {
-        const fresh = ctx.loader.unwrapExports(await ctx.loader.import(entryUrlFinal, () => []))
-        for (const entry of ctx.loader.entries()) {
-          const opts = entry.options as { name?: string; id?: string }
-          if (opts?.name && String(opts.name).includes(match)) {
-            const fiber = entry.fiber
-            if (fiber && typeof fiber === 'object') {
-              // 尝试用新插件导出重建 fiber（entry 的 plugin 引用替换）
-              // ⚠️ 先 await 旧 fiber dispose（异步清理防注册竞态）
-              if (typeof fiber.dispose === 'function') {
-                try { await fiber.dispose() } catch { /* 忽略 */ }
-              }
-              const registry = (ctx as any).registry
-              if (registry && typeof registry.delete === 'function' && typeof registry.plugin === 'function') {
-                registry.delete(fiber)
-                const nf = registry.plugin(fresh, entry.options.config ?? {}, () => [])
-                nf.entry = entry
-                entry.fiber = nf
-              }
-            }
-          }
-        }
-        return `OK: ${match} 坏缓存兜底重载完成（无旧代回滚）`
+        fresh = ctx.loader.unwrapExports(await ctx.loader.import(entryUrlFinal, () => []))
       } catch (e) {
         for (const [u, job] of backup) loadCache.set(u, job)
         return 'ERROR: 兜底 import 失败，已恢复原缓存: ' + (e instanceof Error ? e.stack : String(e))
       }
+      const targets = [...ctx.loader.entries()].filter((en) => {
+        const o = en.options as { name?: string }
+        return o?.name && String(o.name).includes(match) && en.fiber
+      })
+      if (!targets.length) return `OK: ${match} 坏缓存兜底重载完成（无 fiber 需重建）`
+      // ⚠️ 交换走 handoff：dispose 旧 fiber 不能在工具栈里无界等（挂死案底轮）
+      return handoff('reload', match, HANDOFF_MS, async () => {
+        for (const entry of targets) {
+          const fiber = entry.fiber
+          if (!fiber || typeof fiber !== 'object') continue
+          // 先等旧 fiber 完全 dispose 再建新 fiber（防旧注册残留 → duplicate）
+          if (typeof fiber.dispose === 'function') {
+            try { await fiber.dispose() } catch { /* 忽略 */ }
+          }
+          const registry = (ctx as any).registry
+          if (registry && typeof registry.delete === 'function' && typeof registry.plugin === 'function') {
+            registry.delete(fiber)
+            const nf = registry.plugin(fresh, entry.options.config ?? {}, () => [])
+            nf.entry = entry
+            entry.fiber = nf
+          }
+        }
+        return `OK: ${match} 坏缓存兜底重载完成（无旧代回滚，重建 ${targets.length} fiber）`
+      })
     }
 
     const runtime = ctx.registry.get(oldPlugin)
@@ -1198,22 +1590,29 @@ export function apply(ctx: AppContext, config: Config): void {
         return o?.name && String(o.name).includes(match)
       })
       if (target?.fiber) {
+        // 顺序校准：先 purge+import、成功后才动旧代（原实现先 dispose 后 import，
+        // import 一失败就留下「旧代已死、新代没来」的无代可用状态）
+        const backup2 = new Map<string, any>()
+        for (const u of urls) {
+          backup2.set(u, loadCache.get(u))
+          Map.prototype.delete.call(loadCache, u)
+        }
+        let fresh2: any
         try {
-          if (typeof target.fiber.dispose === 'function') await target.fiber.dispose()
-          const backup2 = new Map<string, any>()
-          for (const u of urls) {
-            backup2.set(u, loadCache.get(u))
-            Map.prototype.delete.call(loadCache, u)
-          }
-          const fresh2 = ctx.loader.unwrapExports(await ctx.loader.import(entryUrlFinal, () => []))
+          fresh2 = ctx.loader.unwrapExports(await ctx.loader.import(entryUrlFinal, () => []))
+        } catch (e) {
+          for (const [u, job] of backup2) loadCache.set(u, job)
+          return 'ERROR: entry 重建 import 失败（旧代保留）: ' + (e instanceof Error ? e.stack : String(e))
+        }
+        const staleFiber = target.fiber as any
+        return handoff('reload', match, HANDOFF_MS, async () => {
+          if (staleFiber && typeof staleFiber.dispose === 'function') await staleFiber.dispose()
           const nf2 = ctx.registry.plugin(fresh2, target.options.config ?? {}, () => [])
           nf2.entry = target
           target.fiber = nf2
           normalizeEntriesByName(match)
           return `OK: registry 无 runtime，entry.fiber 直接重建（state=${nf2.state}）`
-        } catch (e) {
-          return 'ERROR: entry 重建失败: ' + (e instanceof Error ? e.stack : String(e))
-        }
+        })
       }
       return 'ERROR: registry 中无该插件 runtime 且 entry 无 fiber'
     }
@@ -1258,112 +1657,118 @@ export function apply(ctx: AppContext, config: Config): void {
 
     // dispose 旧 fiber + 重建（失败 → 尝试用旧插件恢复）
     // ⚠️ 快照 fiber 列表：runtime.fibers 是 DisposableList（活引用），
-    // 下方 await 旧 fiber dispose 会把 fiber 从列表移除——若直接遍历活
-    // 列表，重建循环看到的永远是空列表（实测「重建 0 fiber」）。快照
-    // 必须在 dispose 之前完成。
+    // dispose 旧 fiber 会把 fiber 从列表移除——若直接遍历活列表，重建循环
+    // 看到的永远是空列表（实测「重建 0 fiber」）。快照必须在 dispose 之前。
     const fibers = [...runtime.fibers] as any[]
-    const failures: string[] = []
-    let rebuilt = 0
-    try {
-      const config = currentConfigOf(fibers[0]?._config)
-      // ⚠️ 竞态修复：cordis 的 fiber.dispose() 是异步清理（_unload await disposables，
-      // 含 context/tools 注册注销）——必须先 await 旧 fiber 完全 dispose，
-      // 再建新 fiber，否则新 fiber apply 时旧注册残留 → duplicate（此前热
-      // 重载连环 "already registered" 的根因）。registry.delete 是 fire-and-forget，
-      // 所以这里直接 await entry.fiber 的 dispose（返回 disposalTask Promise）。
-      const entryForDispose = [...ctx.loader.entries()].find((en) => {
-        const o = en.options as { name?: string }
-        return o?.name && String(o.name).includes(match)
-      })
-      const oldFiberEntry = entryForDispose?.fiber
-      if (oldFiberEntry && typeof oldFiberEntry.dispose === 'function') {
-        try {
-          await oldFiberEntry.dispose()
-        } catch { /* dispose 清理失败不阻塞重建 */ }
-      }
-      ctx.registry.delete(oldPlugin)
-      const newFibers: any[] = []
-      for (const oldFiber of fibers) {
-        try {
-          const fiber = oldFiber.parent.registry.plugin(fresh, config, () => [])
-          fiber.entry = oldFiber.entry
-          if (fiber.entry) fiber.entry.fiber = fiber
-          newFibers.push(fiber)
-          rebuilt++
-        } catch (e) {
-          failures.push(String(e))
-        }
-      }
-      // ⚠️ 等新 fiber 完成初始化（loading → active）：registry.plugin 同步返回的
-      // fiber 还是 pending/loading——若不等，随后的 client 操作（processOne 的
-      // !entry.disabled 检查、activeEntry 查找）会基于不稳定状态失败（实测
-      // reload 报 client ✗ 的根因：activeEntry=none → fullName 回落短名 →
-      // processOne 精确匹配失败；reload 返回后 fiber 才转 active 补注册）。
-      await Promise.allSettled(newFibers.map((f) => {
-        const p = typeof f.await === 'function' ? f.await() : undefined
-        return p ?? Promise.resolve()
-      }))
-    } catch (e) {
-      // 整体失败：回滚缓存 + 用旧插件重建
-      for (const [u, job] of backup) loadCache.set(u, job)
+    // ⚠️ 整段交换走 handoff：dispose 旧 fiber 与「等新 fiber 转 active」都是
+    // 等别的 fiber 生命周期，在工具调用栈里无界等会成环（案底 2026-09-07：
+    // reload 挂死宿主、只能重启）。到 HANDOFF_MS 即转后台继续，同一操作不重复触发。
+    return handoff('reload', match, HANDOFF_MS, async () => {
+      const failures: string[] = []
+      let rebuilt = 0
       try {
-        ctx.registry.delete(fresh)
-        for (const oldFiber of fibers) {
-          const fiber = oldFiber.parent.registry.plugin(oldPlugin, currentConfigOf(oldFiber._config), () => [])
-          fiber.entry = oldFiber.entry
-          if (fiber.entry) fiber.entry.fiber = fiber
+        const config = currentConfigOf(fibers[0]?._config)
+        // ⚠️ 竞态修复：cordis 的 fiber.dispose() 是异步清理（_unload await disposables，
+        // 含 context/tools 注册注销）——必须先 await 旧 fiber 完全 dispose，
+        // 再建新 fiber，否则新 fiber apply 时旧注册残留 → duplicate（此前热
+        // 重载连环 "already registered" 的根因）。registry.delete 是 fire-and-forget，
+        // 所以这里直接 await entry.fiber 的 dispose（返回 disposalTask Promise）。
+        const entryForDispose = [...ctx.loader.entries()].find((en) => {
+          const o = en.options as { name?: string }
+          return o?.name && String(o.name).includes(match)
+        })
+        const oldFiberEntry = entryForDispose?.fiber
+        if (oldFiberEntry && typeof oldFiberEntry.dispose === 'function') {
+          try {
+            await oldFiberEntry.dispose()
+          } catch { /* dispose 清理失败不阻塞重建 */ }
         }
-      } catch { /* 尽力而为 */ }
-      const message = String(e instanceof Error ? (e.stack ?? e.message) : e)
-      // 强制登记守卫：duplicate route = 旧 fiber 存在「未登记到 ctx.effect 的裸注册」，
-      // dispose 无法自动注销 → 新注册撞车。检测到即报错要求登记，并自动清理残留自愈。
-      if (message.includes('duplicate') || message.includes('already registered')) {
-        const cleaned = clearRoutesByMatch(match)
-        return 'ERROR: 检测到未登记的裸注册（' + (e instanceof Error ? e.message : String(e))
-          + '）——插件必须把资源注册挂到 ctx.effect（登记后 dispose 自动清理，热重载不再残留）。'
-          + '\n已自动清理疑似残留路由：' + (cleaned.length ? cleaned.join(', ') : '（无）')
-          + '\n请重载重试；若仍失败请检查插件源码中的裸注册。'
+        ctx.registry.delete(oldPlugin)
+        const newFibers: any[] = []
+        for (const oldFiber of fibers) {
+          try {
+            const fiber = oldFiber.parent.registry.plugin(fresh, config, () => [])
+            fiber.entry = oldFiber.entry
+            if (fiber.entry) fiber.entry.fiber = fiber
+            newFibers.push(fiber)
+            rebuilt++
+          } catch (e) {
+            failures.push(String(e))
+          }
+        }
+        // ⚠️ 等新 fiber 完成初始化（loading → active）：registry.plugin 同步返回的
+        // fiber 还是 pending/loading——若不等，随后的 client 操作（processOne 的
+        // !entry.disabled 检查、activeEntry 查找）会基于不稳定状态失败（实测
+        // reload 报 client ✗ 的根因：activeEntry=none → fullName 回落短名 →
+        // processOne 精确匹配失败；reload 返回后 fiber 才转 active 补注册）。
+        await Promise.allSettled(newFibers.map((f) => {
+          const p = typeof f.await === 'function' ? f.await() : undefined
+          return p ?? Promise.resolve()
+        }))
+      } catch (e) {
+        // 整体失败：回滚缓存 + 用旧插件重建
+        for (const [u, job] of backup) loadCache.set(u, job)
+        try {
+          ctx.registry.delete(fresh)
+          for (const oldFiber of fibers) {
+            const fiber = oldFiber.parent.registry.plugin(oldPlugin, currentConfigOf(oldFiber._config), () => [])
+            fiber.entry = oldFiber.entry
+            if (fiber.entry) fiber.entry.fiber = fiber
+          }
+        } catch { /* 尽力而为 */ }
+        const message = String(e instanceof Error ? (e.stack ?? e.message) : e)
+        recordOp('reload', false)
+        // 强制登记守卫：duplicate route = 旧 fiber 存在「未登记到 ctx.effect 的裸注册」，
+        // dispose 无法自动注销 → 新注册撞车。检测到即报错要求登记，并自动清理残留自愈。
+        if (message.includes('duplicate') || message.includes('already registered')) {
+          const cleaned = clearRoutesByMatch(match)
+          return 'ERROR: 检测到未登记的裸注册（' + (e instanceof Error ? e.message : String(e))
+            + '）——插件必须把资源注册挂到 ctx.effect（登记后 dispose 自动清理，热重载不再残留）。'
+            + '\n已自动清理疑似残留路由：' + (cleaned.length ? cleaned.join(', ') : '（无）')
+            + '\n请重载重试；若仍失败请检查插件源码中的裸注册。'
+        }
+        return 'ERROR: 重建失败，已回滚（旧代保留）: ' + message
       }
-      return 'ERROR: 重建失败，已回滚（旧代保留）: ' + message
-    }
 
-    if (failures.length) {
-      return `WARN: ${match} 部分重建（${rebuilt}/${fibers.length}）: ${failures.join('; ')}`
-    }
-    // 清 disabled（幽灵 entry 隔离）：热重载后 client 模块可重新注册（UI 生效）
-    normalizeEntriesByName(match)
-    // ⚠️ 以下 client 操作必须用**完整包名**：client-modules 的 processOne 对
-    // entry.options.name 做精确匹配（短名 ≠ '@dsh-external/...' 完整包名），
-    // 传短名会静默注册失败（实测 reload 报 client ✗ 的根因——microtask flush
-    // 后来用完整名补注册，但返回信息已经错了）。
-    const activeEntry = [...ctx.loader.entries()].find((en) => {
-      const o = en.options
-      return !o.group && String(o.name).includes(match) && en.fiber && FIBER_NAMES[en.fiber.state] === 'active'
-    })
-    const fullName = activeEntry?.options.name ?? match
-    // ═══ 临时诊断（排查 reload 后 client ✗）：写 reload-debug.log ═══
-    try {
-      const dbg = [
-        `[${new Date().toISOString()}] reload match=${match} fullName=${fullName}`,
-        `  activeEntry=${activeEntry ? activeEntry.id : 'none'} fiberState=${activeEntry?.fiber ? FIBER_NAMES[activeEntry.fiber.state] : '?'} entry.disabled=${activeEntry ? activeEntry.disabled : '?'} options.disabled=${activeEntry ? JSON.stringify(activeEntry.options.disabled) : '?'}`,
-      ]
-      const cmDbg = ctx.get('clientModules') as { clientPath?: (id: string) => string | undefined; table?: Map<string, unknown> } | undefined
-      dbg.push(`  cm=${cmDbg ? 'yes' : 'no'} clientPath(short)=${cmDbg?.clientPath ? String(cmDbg.clientPath(match)) : '?'} clientPath(full)=${cmDbg?.clientPath ? String(cmDbg.clientPath(fullName)) : '?'}`)
-      if (cmDbg?.table) {
-        const keys: string[] = []
-        for (const k of cmDbg.table.keys()) keys.push(String(k))
-        dbg.push(`  table keys(${keys.length}): ${keys.filter((k) => k.includes('dsh-external')).join(',') || '(none)'}`)
+      if (failures.length) {
+        recordOp('reload', rebuilt > 0)
+        return `WARN: ${match} 部分重建（${rebuilt}/${fibers.length}）: ${failures.join('; ')}`
       }
-      appendFileSync(join(dshHome, 'super-injector', 'reload-debug.log'), dbg.join('\n') + '\n')
-    } catch { /* 诊断失败不阻塞 */ }
-    // client 模块补扫（表丢失/从未注册时自愈——web 重启后幽灵 entry 场景）
-    refreshClientRow(fullName)
-    // client bundle 联动：host 重载后 bundle rev 变化通知浏览器（改 UI → 免手动刷新）
-    notifyClientRebuilt(fullName)
-    // 自检：完整包名查表（表 key 是完整包名，完全匹配）
-    const client = clientStatus(fullName)
-    recordOp('reload', rebuilt > 0)
-    return `OK: ${match} 热重载完成（清缓存 ${urls.length} 模块，重建 ${rebuilt} fiber）\n- ${client}`
+      // 清 disabled（幽灵 entry 隔离）：热重载后 client 模块可重新注册（UI 生效）
+      normalizeEntriesByName(match)
+      // ⚠️ 以下 client 操作必须用**完整包名**：client-modules 的 processOne 对
+      // entry.options.name 做精确匹配（短名 ≠ '@dsh-external/...' 完整包名），
+      // 传短名会静默注册失败（实测 reload 报 client ✗ 的根因——microtask flush
+      // 后来用完整名补注册，但返回信息已经错了）。
+      const activeEntry = [...ctx.loader.entries()].find((en) => {
+        const o = en.options
+        return !o.group && String(o.name).includes(match) && en.fiber && FIBER_NAMES[en.fiber.state] === 'active'
+      })
+      const fullName = activeEntry?.options.name ?? match
+      // ═══ 临时诊断（排查 reload 后 client ✗）：写 reload-debug.log ═══
+      try {
+        const dbg = [
+          `[${new Date().toISOString()}] reload match=${match} fullName=${fullName}`,
+          `  activeEntry=${activeEntry ? activeEntry.id : 'none'} fiberState=${activeEntry?.fiber ? FIBER_NAMES[activeEntry.fiber.state] : '?'} entry.disabled=${activeEntry ? activeEntry.disabled : '?'} options.disabled=${activeEntry ? JSON.stringify(activeEntry.options.disabled) : '?'}`,
+        ]
+        const cmDbg = ctx.get('clientModules') as { clientPath?: (id: string) => string | undefined; table?: Map<string, unknown> } | undefined
+        dbg.push(`  cm=${cmDbg ? 'yes' : 'no'} clientPath(short)=${cmDbg?.clientPath ? String(cmDbg.clientPath(match)) : '?'} clientPath(full)=${cmDbg?.clientPath ? String(cmDbg.clientPath(fullName)) : '?'}`)
+        if (cmDbg?.table) {
+          const keys: string[] = []
+          for (const k of cmDbg.table.keys()) keys.push(String(k))
+          dbg.push(`  table keys(${keys.length}): ${keys.filter((k) => k.includes('dsh-external')).join(',') || '(none)'}`)
+        }
+        appendFileSync(join(dshHome, 'super-injector', 'reload-debug.log'), dbg.join('\n') + '\n')
+      } catch { /* 诊断失败不阻塞 */ }
+      // client 模块补扫（表丢失/从未注册时自愈——web 重启后幽灵 entry 场景）
+      refreshClientRow(fullName)
+      // client bundle 联动：host 重载后 bundle rev 变化通知浏览器（改 UI → 免手动刷新）
+      notifyClientRebuilt(fullName)
+      // 自检：完整包名查表（表 key 是完整包名，完全匹配）
+      const client = clientStatus(fullName)
+      recordOp('reload', rebuilt > 0)
+      return `OK: ${match} 热重载完成（清缓存 ${urls.length} 模块，重建 ${rebuilt} fiber）\n- ${client}`
+    })
   }
 
   // ============ 插件状态 ============
@@ -1371,17 +1776,30 @@ export function apply(ctx: AppContext, config: Config): void {
   function listPlugins(): string {
     const lines: string[] = []
     const injectedNames = new Set(readRegistry().map((e) => e.name))
+    // ⚠️ 缺陷 B（实测 2026-10-15）：宿主未开 --expose-internals ⇒
+    // loader.internal 为 undefined，旧代码此处用 `internal!` 非空断言直接崩
+    // （Cannot read properties of undefined (reading 'loadCache')）——
+    // dev_plugin_status 整个工具不可用。改为可选访问：拿不到缓存就只少一行
+    // entry 路径，清单本身照常输出。
+    const cache = ctx.loader.internal?.loadCache as Map<string, unknown> | undefined
     for (const entry of ctx.loader.entries()) {
       const opts = entry.options
       if (opts.group) continue
       const state = entry.fiber ? (FIBER_NAMES[entry.fiber.state] ?? `state:${entry.fiber.state}`) : 'no-fiber'
-      const entryUrl = [...ctx.loader.internal!.loadCache.keys()]
-        .find(u => typeof u === 'string' && u.includes(opts.id))
+      const entryUrl = cache
+        ? [...cache.keys()].find(u => typeof u === 'string' && u.includes(opts.id))
+        : undefined
       // 注入插件标记 [injected]（与 bundle 装配区分，避免 hash id 难认）
       const injected = injectedNames.has(opts.name) ? ' [injected]' : ''
       lines.push(`- [${state}] ${opts.id} (${opts.name})${injected}${opts.disabled ? ' [disabled]' : ''}${entryUrl ? '\n    entry: ' + entryUrl : ''}`)
     }
-    return lines.length ? lines.join('\n') : '（loader 中无已装配插件 entry）'
+    let out = lines.length ? lines.join('\n') : '（loader 中无已装配插件 entry）'
+    // 后台收口公示：handoff 把「等不到就转后台」的操作记在这里——异步化不丢可观测性
+    if (bgOps.size) {
+      out += '\n===== 后台操作（有界交接转后台）=====\n'
+        + [...bgOps.entries()].map(([k, v]) => `- ${k} [${v.state}] ${v.kind} @${new Date(v.at).toISOString()} :: ${v.detail}`).join('\n')
+    }
+    return out
   }
 
   /** 查找匹配的 entry（id 或 name 子串）——优先活跃 entry，跳过 disposed/failed/disabled 残留。 */
@@ -1494,7 +1912,7 @@ export function apply(ctx: AppContext, config: Config): void {
     parameters: {
       name: { type: 'string', required: true, description: '工具名（唯一）' },
       description: { type: 'string', required: true, description: '工具描述' },
-      parameters: { type: 'json', description: '参数 schema（可选，留空则无参）' },
+      parameters: { type: 'json', description: '参数 schema（可选，留空则无参）。推荐 ParameterSchemaSpec 裸属性表：{ dir: { type: "string", required: true, description: "..." } }；写 JSON Schema（{type:"object",properties:{...},required:[...]}）也可，转正时会自动转换' },
       execute: { type: 'string', required: true, description: 'JS 代码：function(args, ctx){ return ... }' },
     },
     output: { schema: { type: 'string' }, render: (_a: unknown, v: unknown) => [{ type: 'text', text: String(v) }] },
@@ -1530,10 +1948,31 @@ export function apply(ctx: AppContext, config: Config): void {
     async execute(a: any) {
       const t = staged.get(a.name)
       if (!t) return `ERROR: staging 无此工具（${a.name}）——dev_stage_list 查看`
+      // ⚠️ 异步逃逸兜底（2026-09-12 崩溃循环案底）：下面这层 try/catch 只接得住
+      // **同步抛出**与**被 await 的 rejection**。漏出去的是后侧工具里**未被 await 的
+      // promise rejection** —— Node 默认行为是直接杀进程，表现为宿主
+      // `dsh: fatal load failure` 退出 code=1，而桌面壳会无条件重启 → 崩溃循环，
+      // 用户只看到「反反复复重启」。实测栈：SessionQueryError（本部署 session-query
+      // 配置成 openAt:"never"，搜索被禁用）从 staged 工具的执行路径逃出。
+      //
+      // ★★ **注意：这【不是】安全网**（安全网是上面那段【常驻】兜底）——
+      //   本监听**只负责"把逃逸告诉调用者"**（把栈回执进工具输出，便于当场定位）。
+      //   ⚠️ 曾误以为"只挂调用窗口就够" ⇒ **被负对照打红**：`unhandledRejection` 在微任务
+      //      队列**排空之后**才上报，`finally` 摘监听时它还没上报 ⇒ **窗口一关等于没挂**。
+      //      ⇒ 所以安全网必须是【常驻】的；本处保留是为了**回执**，不是为了让进程不退出。
+      //   只兜 rejection，不兜 uncaughtException —— 后者接住会让进程带伤继续跑，风险更大。
+      const escaped: unknown[] = []
+      const onRej = (r: unknown): void => { escaped.push(r instanceof Error ? (r.stack ?? r.message) : String(r)) }
+      process.on('unhandledRejection', onRej)
       try {
-        return String(await t.execute(a.args ?? {}, ctx))
+        const out = String(await t.execute(a.args ?? {}, ctx))
+        return escaped.length
+          ? out + `\n⚠ 后侧工具「${a.name}」逃逸了未被 await 的 rejection（已降级，宿主未受影响）：\n` + escaped.join('\n') + '\n修法：在该工具里 await 所有异步调用。'
+          : out
       } catch (e) {
         return 'ERROR: ' + (e instanceof Error ? (e.stack ?? e.message) : String(e))
+      } finally {
+        process.off('unhandledRejection', onRej)
       }
     },
   }))
@@ -1550,6 +1989,43 @@ export function apply(ctx: AppContext, config: Config): void {
     },
   }))
 
+  /**
+   * 把 staging 里存的 parameters **归一化**成 defineTool 要求的 ParameterSchemaSpec。
+   *
+   * ⚠️ 实测 bug（2026-10-15，转正链路首测暴露）：staging 的 parameters 常写成
+   * JSON Schema（`{ type:'object', properties:{ dir:{type:'string'} }, required:[...] }`），
+   * 而 defineTool 要的是 **ParameterSchemaSpec —— 裸属性表**（`{ dir:{type:'string'} }`）。
+   * 旧实现直接 `parameters: t.parameters as never` 透传，于是转正时报
+   * `JsonSchemaError: unsupported JSON schema: parameters.type must be a value schema object`
+   * ——报错信息完全没提「形状不对」，极难定位。
+   *
+   * 本函数两种形状都接受：
+   *   - 已是裸属性表（无顶层 type/properties）⇒ 原样使用；
+   *   - JSON Schema 对象（有 properties）⇒ 抽出 properties，并把 required 数组
+   *     转成各属性的 `required: true`（ParameterSchemaSpec 的写法）。
+   * 同时把 `required` 从属性对象里保留（两种写法都兼容，DSH 只认属性上的 required）。
+   */
+  function normalizeParams(raw: unknown): Record<string, unknown> {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return {}
+    const obj = raw as Record<string, unknown>
+    const looksLikeJsonSchema =
+      typeof obj.type === 'string' || (obj.properties !== null && typeof obj.properties === 'object')
+    if (!looksLikeJsonSchema) return obj // 已是裸属性表
+    const props = (obj.properties ?? {}) as Record<string, unknown>
+    const required = Array.isArray(obj.required) ? (obj.required as string[]) : []
+    const out: Record<string, unknown> = {}
+    for (const [key, spec] of Object.entries(props)) {
+      if (spec === null || typeof spec !== 'object' || Array.isArray(spec)) {
+        out[key] = { type: 'string' }
+        continue
+      }
+      const s = { ...(spec as Record<string, unknown>) }
+      if (required.includes(key)) s.required = true
+      out[key] = s
+    }
+    return out
+  }
+
   safeRegister(defineTool({
     name: 'dev_stage_promote',
     description: '转正：把 staging 工具一键挂"前侧"（正式注册进 tools schema，下一次请求缓存刷新一次）。确认工具有效后使用。',
@@ -1564,7 +2040,8 @@ export function apply(ctx: AppContext, config: Config): void {
         const dispose = ctx.effect(() => ctx.tools.register(defineTool({
           name: a.name,
           description: t.description,
-          parameters: t.parameters as never,
+          // ⚠️ 必须归一化：JSON Schema → ParameterSchemaSpec（详见 normalizeParams）
+          parameters: normalizeParams(t.parameters) as never,
           output: { schema: { type: 'string' }, render: (_x: unknown, v: unknown) => [{ type: 'text', text: String(v) }] },
           async execute(args: Record<string, unknown>) {
             return String(await t.execute(args, ctx))
@@ -1573,6 +2050,8 @@ export function apply(ctx: AppContext, config: Config): void {
         t.disposer = () => dispose()
       } catch (e) {
         return 'ERROR: 转正注册失败: ' + String(e)
+          + '\n提示：parameters 需为 ParameterSchemaSpec（裸属性表，如 { dir: { type: "string" } }）；'
+          + '若写的是 JSON Schema（含 type/properties），本工具会自动转换——若仍失败请检查属性 schema 是否合法。'
       }
       t.promoted = true
       saveStaging()
@@ -1947,7 +2426,8 @@ export function apply(ctx: AppContext, config: Config): void {
       try { linkExists = lstatSync(linkDir).isSymbolicLink() || lstatSync(linkDir).isDirectory() } catch { /* 不存在 */ }
       if (!linkExists || !isHealthyLink(linkDir)) {
         if (linkExists) {
-          try { rmSync(linkDir, { recursive: true, force: true }) } catch { /* 删除失败尝试覆盖 */ }
+          // ⚠️ 只删链接本身，绝不递归进目标（见 removeLinkOnly 注释）。
+          try { removeLinkOnly(linkDir) } catch { /* 删除失败尝试覆盖 */ }
         }
         mkdirSync(dirname(linkDir), { recursive: true })
         symlinkSync(absDir, linkDir, 'junction')
@@ -2061,16 +2541,36 @@ export function apply(ctx: AppContext, config: Config): void {
     return 'OK: 卸载完成\n- ' + steps.join('\n- ')
   }
 
-  /** junction 健康检查：能读目录 = 目标可达（Windows 断电后悬空 junction 的 lstat 仍是链接但读目录抛错）。
-   *  ⚠️ 真实（非链接）目录/文件视为健康——它们是 profile 包管理器（pnpm hoisted 布局）管理的
-   *  安装实体，绝不能被当成"不健康链接"删除重建（2026-08 事故：dsh-better-sidebar 经
-   *  pnpm 装进 profile 后 dev_inject_plugin 把整个包目录 rmSync 掉换成了自指 junction）。 */
+  /** 安全删除链接本身：**绝不递归进目标**。
+   * ⚠️ 实测（2026-10-15）：本机 Windows + Node 24 上 rmSync(junction,{recursive:true})
+   * 的 5 种形态（跨卷/嵌套/链式/父目录递归）**都**没有删穿目标 —— 也就是说它
+   * 在当前环境是安全的。但"语言级未定义行为能删穿 junction 目标"是 Windows 上
+   * 长期存在的坑，而本函数是**依赖目录**（vendor/*、profile node_modules/*）的
+   * 唯一清理通道——一旦踩中就是静默毁依赖。故改为按类型分派，链接只用 rmdir/
+   * unlink（语义上只删链接、绝不触目标），真目录才递归删。 */
+  function removeLinkOnly(p: string): void {
+    let isLink = false
+    try { isLink = lstatSync(p).isSymbolicLink() } catch { return }
+    if (isLink) {
+      try { rmdirSync(p) } catch {
+        try { rmSync(p, { recursive: false, force: true }) } catch { /* 忽略 */ }
+      }
+      return
+    }
+    rmSync(p, { recursive: true, force: true })
+  }
+
+  /** junction 健康检查：链接存在 **且目标真的可用**。
+   * ⚠️ 修复（2026-10-15，实测复现）：旧实现只做 `readdirSync(p)` 判"能读目录
+   * 即健康"，而**目标目录被清空**时 readdirSync **仍然成功**（返回 []）⇒ 一个
+   * 被掏空的依赖目录被误判为健康 ⇒ 自愈永不重建 ⇒ 依赖静默坏掉、直到启动
+   * 加载失败才暴露（本机实测：4 个 vendor 目标的 items=0，旧判据一律返回 true；
+   * 同刻插件自身加载失败 `Cannot find package ... index.js`）。
+   * 判据收紧为：**空目标 = 不健康（必须重建）**；非空 = 目标可达、健康。 */
   function isHealthyLink(p: string): boolean {
     try {
-      const st = lstatSync(p)
-      if (!st.isSymbolicLink()) return true
-      readdirSync(p)
-      return true
+      if (!lstatSync(p).isSymbolicLink()) return false
+      return readdirSync(p).length > 0
     } catch {
       return false
     }
@@ -2082,35 +2582,62 @@ export function apply(ctx: AppContext, config: Config): void {
    * 返回问题列表（空 = 健康）。lib 与 src 双检查（只有 lib 无 src 不绕过）。
    * ⚠️ slot 白名单（2026-08-14 dsh-external-plugins 事件教训）：注册的 slot 名
    * 必须位于已知合法集合内——早期只认 conversation.view，导致 settings.plugin.item
-   * 等设置页卡片被误判为坏骨架；同时白名单外的陌生 slot 名仍视为异常，防 typo。 */
-  const KNOWN_SLOTS = ['conversation.view', 'settings.plugin.item', 'settings.plugins.tab', 'settings.section', 'settings.general.item', 'conversation.session.header.actions', 'conversation.session.header.utilities', 'conversation.input.dock', 'conversation.composer.dock', 'sidebar.footer.action', 'shell.overlay']
+   * 等设置页卡片被误判为坏骨架；同时白名单外的陌生 slot 名仍视为异常，防 typo。
+   * 名单来源（2026-09-10 从官方 dsh-client-* 的 client.js 抽取的全集）：早期硬编码 11 项
+   * 漏掉右侧栏/主壳/会话头那一大批，照样误判——**名单必须跟着官方 client 包更新**。 */
+  const KNOWN_SLOTS = ['main', 'main.conversation', 'root', 'sidebar', 'sidebar.brand.mark', 'sidebar.brand.name', 'sidebar.settings', 'sidebar.workspaces', 'sidebar.workspaces.directoryFlow', 'sidebar.footer.action', 'sidebar.right.pane.tab', 'sidebar.right.pane.tab.title', 'sidebar.right.tab.document', 'rightbar', 'rightbar.session', 'conversation.view', 'conversation.session', 'conversation.session.header', 'conversation.session.header.actions', 'conversation.session.header.corner', 'conversation.session.header.lineage', 'conversation.session.header.utilities', 'conversation.composer', 'conversation.composer.bar', 'conversation.composer.dock', 'conversation.input.dock', 'conversation.input.model', 'conversation.input.overlay', 'conversation.input.plan', 'conversation.input.attachments', 'conversation.chat.node', 'conversation.chat.assistant-actions', 'conversation.chat.turnTail', 'conversation.hero.agentPreset', 'conversation.hero.workspace', 'conversation.hero.workspace.directoryFlow', 'conversation.message.images', 'conversation.trajectory.images', 'conversation.approval.detail', 'settings.trigger', 'settings.header', 'settings.close', 'settings.section', 'settings.action', 'settings.general.item', 'settings.plugin.item', 'settings.plugins.tab', 'settings.onboarding', 'tool.call.images', 'tool.call.toolview', 'shell.overlay']
   const SLOT_ALT = KNOWN_SLOTS.map((s) => s.replace(/\./g, '\\.')).join('|')
-  const REGISTER_NAME = new RegExp(`register\\(\\{[\\s\\S]*?name:\\s*['"](${SLOT_ALT})['"]`)
+  // v42 修正（2026-09-10）：官方右侧栏的注册是**两步式**——先
+  // `ctx.slots.inject('sidebar.right.pane.tab', () => ctx.slots.register({ name, key }, Body))`，
+  // 于是 `register({` 与 `name:` 之间有 `inject(...)` 的回调头，旧正则要求两者紧邻会误判
+  // 合法插件为坏骨架（实测：dsh-agent-browser 被阻断注入）。改成在 register({...}) 的
+  // 花括号段内任意位置找 name，既不放过 typo，也不再要求书写顺序。
+  // ⚠️ **`{0,400}` 这个上限的作用**：`[\s\S]*?` 是**惰性**的 ⇒ 若某个 `register({` 的对象里
+  //    根本没有 `name:`，它会**一路越过 `}` 继续找后面任意位置的 `name:`** ⇒ 于是"漏写 name
+  //    的 typo"会被误判成合法 ⇒ **上限是为了不跨到下一个 register/别的对象**。
+  //   ⚠️ **但它是【紧的】**：实测合法注册里，`register({` 到 `name:` 的距离跨度 **11 ~ 609 字符**
+  //      （`dsh-agent-browser` 与 `dsh-org-panel` 各有一处 **452 / 609**）
+  //      ⇒ 若某插件**只有一处** slot 注册、且对象头很长 ⇒ **400 会把它误判成坏骨架**。
+  //      （当前那几例不触发：它们另有近距离注册，而本检查是 `.test()`（任一命中即可）。）
+  //   ⇒ ★ **标注：阈值 400 的来历我未核**（它不是我定的）—— 记在此处，供 owner 复看。
+  const REGISTER_NAME = new RegExp(`register\\(\\{[\\s\\S]{0,400}?name:\\s*['"](${SLOT_ALT})['"]`)
 
   function clientSkeletonProblems(base: string): string[] {
     const problems: string[] = []
+    // v41 修正：**不是每个 client 入口都要注册 slot**。两种合法例外实测被误判为坏骨架
+    // （17 次启动都被跳过恢复，最早 2026-09-08 10:34Z）：
+    //   ① 空占位 client（dsh-engram-relay：图谱 Tab 已移除，只留 ctx.effect 占位）
+    //   ② 走别的服务挂 UI（dsh-browser-panel：betterSidebar.registerTab / 直接挂 DOM，
+    //      且刻意不声明硬 inject——sessions 是可选获取的）
+    // 原检查假定「client = 一定注册 slot」，于是要求 inject 含 slots + register 带合法 name。
+    // 现在只在**代码真的引用 slots** 时才要求这两项——「想注册却忘了声明 inject」照样抓得住。
+    const usesSlots = (text: string): boolean => /ctx\.slots|slots\.register/.test(text)
     try {
       // 1. 编译产物（实际运行文件）——lib/client.js（CJS bundle）
       // ⚠️ 正则兼容单双引号（实测：用户手修用 "slots" 双引号——只认单引号会误判健康插件）
       const libClient = join(base, 'lib', 'client.js')
       if (existsSync(libClient)) {
         const lib = readFileSync(libClient, 'utf8')
-        if (!/inject\s*=\s*\[[^\]]*['"]slots['"]/.test(lib) && !/inject\s*:\s*\[[^\]]*['"]slots['"]/.test(lib)) {
-          problems.push('lib/client.js 缺 inject 含 slots（apply 用 ctx.slots 必须声明——cordis 服务注入契约）')
-        }
-        if (!REGISTER_NAME.test(lib)) {
-          problems.push(`lib/client.js 的 register 缺合法 name（应为已知 slot：${KNOWN_SLOTS.join(' / ')}）`)
+        if (usesSlots(lib)) {
+          if (!/inject\s*=\s*\[[^\]]*['"]slots['"]/.test(lib) && !/inject\s*:\s*\[[^\]]*['"]slots['"]/.test(lib)) {
+            problems.push('lib/client.js 用了 ctx.slots 却缺 inject 含 slots（cordis 服务注入契约）')
+          }
+          if (!REGISTER_NAME.test(lib)) {
+            problems.push(`lib/client.js 的 register 缺合法 name（应为已知 slot：${KNOWN_SLOTS.join(' / ')}）`)
+          }
         }
       }
       // 2. 源码骨架（有 src 时）
       const clientSrcPath = join(base, 'src', 'client', 'index.ts')
       if (existsSync(clientSrcPath)) {
         const src = readFileSync(clientSrcPath, 'utf8')
-        if (!/export const inject\s*=\s*\[[^\]]*['"]slots['"]/.test(src)) {
-          problems.push("src/client/index.ts 缺 export const inject = ['slots']（apply 用 ctx.slots 必须声明，否则报 cannot get property 'slots' without inject）")
-        }
-        if (!REGISTER_NAME.test(src)) {
-          problems.push(`slots.register 缺合法 name（应为已知 slot：${KNOWN_SLOTS.join(' / ')}——缺了报 slot undefined is not declared）`)
+        if (usesSlots(src)) {
+          if (!/export const inject\s*=\s*\[[^\]]*['"]slots['"]/.test(src)) {
+            problems.push("src/client/index.ts 用了 ctx.slots 却缺 export const inject = ['slots']（否则报 cannot get property 'slots' without inject）")
+          }
+          if (!REGISTER_NAME.test(src)) {
+            problems.push(`slots.register 缺合法 name（应为已知 slot：${KNOWN_SLOTS.join(' / ')}——缺了报 slot undefined is not declared）`)
+          }
         }
       }
     } catch { /* 读不到文件时跳过 */ }
@@ -2229,9 +2756,17 @@ export function apply(ctx: AppContext, config: Config): void {
         const linkDir = join(profileNodeModules, scope ?? '')
         const linkPath = join(linkDir, scope ? name.split('/')[1] as string : name)
         if (!isHealthyLink(linkPath)) {
+          // ⚠️ 只删链接本身：先 lstat 确认是链接才 rmdir；**真目录一律不动**
+          // （真目录意味着这里有实体内容，删掉是数据损失，宁可跳过让用户排查）。
           try {
-            if (existsSync(linkPath)) rmdirSync(linkPath)
-          } catch { /* 坏链接删除失败忽略 */ }
+            const st = lstatSync(linkPath)
+            if (st.isSymbolicLink()) rmdirSync(linkPath)
+            else {
+              logger.warn('[super-injector] 跳过自愈：%s 是真目录而非链接（不删实体内容）', linkPath)
+              continue
+            }
+          }
+          catch { /* 不存在则直接建 */ }
           try {
             mkdirSync(linkDir, { recursive: true })
             symlinkSync(target, linkPath, 'junction')
@@ -2257,6 +2792,25 @@ export function apply(ctx: AppContext, config: Config): void {
     return healed
   }
 
+  /**
+   * 读 profile `package.json` 的 `dsh.profile.bundles` 列表（**只读，失败 ⇒ 空数组**）。
+   * ★ 用途：**bundles 防重护栏**（见 `restore()` ②）—— 判断"这个包是不是已经由 bundles 装配"。
+   * ⚠️ 路径必须跟随**当前 profile**（缺陷 A 同族，2026-10-15 修）：旧实现写死
+   * `profiles/web`，在 desktop profile 下读到的是**另一个 profile 的 bundles**
+   * ⇒ 防重护栏判错（把已装配的包当成没装配而重复注入）。
+   * 正解：用 profileNodeModules 的父目录（= 当前 profile 根）。
+   */
+  function readProfileBundles(): string[] {
+    try {
+      const pkgPath = join(dirname(profileNodeModules), 'package.json')
+      const pkg = JSON.parse(readFileSync(pkgPath, 'utf8'))
+      const list = pkg?.dsh?.profile?.bundles
+      return Array.isArray(list) ? list.filter((x: unknown) => typeof x === 'string') : []
+    } catch {
+      return []
+    }
+  }
+
   async function restore(): Promise<void> {    // ① profile link 依赖 junction 自愈（断电/强制关机后 junction 悬空 → 重建；
     //    覆盖 bundles 装配依赖 + agent preset 解析依赖，见 healProfileLinks）。
     try {
@@ -2265,8 +2819,19 @@ export function apply(ctx: AppContext, config: Config): void {
       logger.warn('[super-injector] junction 自愈扫描失败: %s', String(err))
     }
     // ② 注入清单恢复（原逻辑）
+    // ⚠️ bundles 防重护栏（2026-09-08 closedloop 双装配事故）：包已列进 profile
+    // package.json 的 dsh.profile.bundles 时，重启后由 bundles 正常装配——此处再
+    // 恢复会造第二实例（boot 早期 bundle entry 尚未 active，hasActiveEntry 拦不住），
+    // 命中 duplicate namespace/route 直接炸整棵 plugin tree。dev_install_package 后
+    // registry 若残留旧 dev_inject 条目即触发；跳过 + 审计，不删条目（保留观感）。
+    const bundlesOwned = new Set(readProfileBundles())
     for (const e of readRegistry()) {
       try {
+        if (bundlesOwned.has(e.name)) {
+          auditLog('restore-skip-bundles-owned', `${e.name} 已由 profile bundles 装配，跳过 registry 恢复（防双实例）`)
+          logger.info('[super-injector] %s 由 bundles 装配，跳过 registry 恢复（防双实例）', e.name)
+          continue
+        }
         if (hasActiveEntry(e.name)) continue
         // ⚠️ 恢复前 client 骨架校验（pixel-forge 事件教训：坏 client 插件
         // 恢复 → apply 失败 → 整个 HARNESS 启动失败——用户被迫手动修）。
@@ -2297,7 +2862,31 @@ export function apply(ctx: AppContext, config: Config): void {
   // ⚠️ P1（压测发现③）：目录消失/悬空（junction 指向的源被删/改名）时
   // fingerprintOf 返回 null——若盲目跳过静默，目录反复消失/恢复会产生乒乓
   // reload 且虚增 ✓、无审计。这里抑制重载 + 审计一次（30s 节流防刷屏）。
-  const lastDangleTs = new Map<string, number>()
+  //
+  // ══ 🔴 v0.3.6 修（真机实测：节流挡不住**永久消失**的目录）════════════════════
+  // 病案（2026-10-17 实测）：
+  //   `self-heal.log` **4916 行**，其中 **4738 行**是同一条：
+  //     `watch-dangling: 目录不可读…: F:\dsh-plugin\_e2e-demo`
+  //   而那个目录**早就不存在了**（registry 里还留着条目）⇒
+  //   每 30 秒一条 ⇒ **每天 ~2880 行**，永不停止。
+  //
+  //   根因：原来的 30s 节流是「**限速**」而不是「**放弃**」——
+  //     它只保证"不会刷得太快"，却假设目录**迟早会回来**。
+  //     对"永久消失"（源被删/移走）这种情形，它**永远不收敛**。
+  //   ⚠️ 与文件里 v1.3.11 那条同族（`pendingEvicted` 的教训）：
+  //     **"无限重试"必须有一个可观测的上界**，否则日志/资源被慢性耗尽。
+  //
+  //   修法（两级）：
+  //     ① 前 N 次仍节流上报（目录可能是**暂时**不可读：正在 build / 权限抖动）
+  //     ② 超过 N 次 ⇒ 判为「永久消失」：**只报一次**并停止重复，
+  //        同时给出**可操作**的出口（怎么清掉这条 registry 条目）
+  //   ⚠️ 判据：**"暂时"与"永久"必须用次数区分**——只靠时间间隔区分不了。
+  //     且恢复可读时计数清零（目录回来了就当没发生过）。
+  // ⚠️ 状态只剩**一个** Map（早前是两个：count + lastTs）——
+  //   两处分别维护"同一件事的两半"正是本项目反复栽的形状（"两个口算同一个数"）：
+  //   任一处漏更新，`count` 与 `ts` 就会打架。⇒ 合并为单一 state 对象，整体替换。
+  const dangleState = new Map<string, NonNullable<DangleState>>()
+  const dangleGoneMs = DANGLE_GONE_AFTER_MS
   let reloading = false
   ctx.setInterval(() => {
     if (reloading) return
@@ -2312,14 +2901,25 @@ export function apply(ctx: AppContext, config: Config): void {
       const fp = fingerprintOf(join(w.dir, 'lib'))
       if (fp === null) {
         const now = Date.now()
-        const prevDang = lastDangleTs.get(w.dir)
-        if (prevDang === undefined || now - prevDang > 30000) {
-          lastDangleTs.set(w.dir, now)
+        // ⚠️ 决策走**纯函数**（dangleDecision）—— 那是被测试覆盖的那一份，
+        //   而不是"内联一份能跑但没人测的"。抽出来的理由见该模块的注释。
+        const d = dangleDecision(dangleState.get(w.dir), now, dangleGoneMs)
+        dangleState.set(w.dir, d.next)
+        if (d.action === 'warn') {
           auditLog('watch-dangling', `目录不可读，跳过自动重载（源被删/悬空 junction）: ${w.dir}`)
+        } else if (d.action === 'report-gone') {
+          // ⚠️ 措辞要点出**连续多久**（时间语义）—— 而不是"第几次"（次数语义）。
+          //   因为判据是时间：轮询周期可配置，次数含义会漂。
+          const mins = Math.round((now - d.next.firstTs) / 60000)
+          auditLog('watch-dangling-gone',
+            `目录已连续不可读约 ${mins} 分钟 ⇒ 判为**永久消失**，停止重复上报（不再刷日志）: ${w.dir}`
+            + `　⇒ 清理：dev_uninject_plugin ${w.match}　或从 registry 删掉该条目`)
         }
+        // 'silent' ⇒ 什么都不写（这就是修复点：不再每轮刷一行）
         continue
       }
-      lastDangleTs.delete(w.dir)
+      // 目录恢复可读 ⇒ 状态清零（"连续不可读"才是信号；偶发抖动不该累积）
+      if (dangleState.has(w.dir)) dangleState.delete(w.dir)
       const prev = fingerprints.get(w.dir)
       if (prev !== undefined && prev !== fp) {
         fingerprints.set(w.dir, fp)
@@ -2429,7 +3029,9 @@ export function apply(ctx: AppContext, config: Config): void {
         auditLog('inject-stale-artifacts', `${dir}: ${fresh.warn.join('; ')}`)
         logger.warn('[super-injector] 注入 %s 构建产物可能过期（未阻断）: %s', dir, fresh.warn.join('; '))
       }
-      return withOpLock(() => inject(dir))
+      // 同上（2026-09-12）：工具边界统一有界交接——注入同样要 await 别的 fiber 生命周期。
+      // ⚠️ 嵌套顺序有意义：**handoff 在外（先设边界）· withOpLock 在内（再拿操作锁）**。
+      return handoff('inject', dir, HANDOFF_MS, () => withOpLock(() => inject(dir)))
     },
   }))
 
@@ -2463,7 +3065,8 @@ export function apply(ctx: AppContext, config: Config): void {
     async execute(args: { match: string; self?: boolean }) {
       const match = String(args?.match ?? '').trim()
       if (!match) return 'ERROR: match 必填（包名/路径子串）'
-      return withOpLock(() => uninject(match, Boolean(args.self)))
+      // 同上（2026-09-12）：卸载要 dispose fiber，是同一类无界等待。
+      return handoff('uninject', match, HANDOFF_MS, () => withOpLock(() => uninject(match, Boolean(args.self))))
     },
   }))
 
@@ -2499,7 +3102,7 @@ export function apply(ctx: AppContext, config: Config): void {
 
   safeRegister(defineTool({
     name: 'dev_reload_package',
-    description: '确定性热重载已加载的 bundle 插件包（清缓存 → 重新 import → registry 重建 fiber，失败回滚保留旧代）。不带参数时返回当下已装配插件清单；带参数重载并给出重载前后 fiber 状态对比。',
+    description: '热重载已加载的 bundle 插件包（清缓存 → 重新 import → 释放旧 fiber → registry 重建 fiber，失败回滚保留旧代）。不带参数 = 只列已装配清单（含「后台操作」收口结果）；带 packageName = 重载并给出前后 fiber 状态。安全网（案底 2026-09-07：工具栈内 await dispose 与工具调度器成环，挂死宿主需重启）：交换最多在内联等 6s，到点即转后台继续同一操作（不重复触发），回执为 WARN +「已转后台」——此时用本工具不带参数看「后台操作」确认 done/failed，长期 running 才需重启宿主。',
     parameters: {
       packageName: { type: 'string', description: '包路径子串（缺省 = 只列插件清单，不重载）' },
     },
@@ -2513,14 +3116,24 @@ export function apply(ctx: AppContext, config: Config): void {
       }
       const entry = findEntry(args.packageName)
       const before = entry ? stateOf(entry) : '（未找到）'
-      const result = await withOpLock(() => reloadPackage(args.packageName!))
+      // ⚠️ 外层有界交接（2026-09-12 二次吊死案底）：内层 handoff 只盖住「dispose 旧 fiber →
+      // 重建 fiber」那一段，而 import / 取锁 / findEntry 全在网外。任一处无界等，整个工具
+      // 调用就永不返回——宿主活着，会话被自己的 reload 吊死（实测证据：16:07:31Z 那次
+      // 连一行 reload-debug 都没写，说明卡点在网外的 import 或取锁，而非内层 dispose）。
+      // 纪律升级：**工具边界**是最终兜底网，任何内层超时都只是提前量。
+      // ⚠️ 嵌套顺序有意义：**handoff 在外（先设边界）· withOpLock 在内（再拿操作锁）**。
+      const result = await handoff('reload', args.packageName!, HANDOFF_MS, () => withOpLock(() => reloadPackage(args.packageName!)))
       // ⚠️ 误报修复（2026-08 实测 "disposed（超时未稳定）" 假象）：重载后
       // loader 可能替换/重建 entry 对象——**旧 entry 引用指向已 dispose 的
       // 旧 fiber**，waitFiberStable 轮询 3 秒都读旧状态 → 误报。必须重新
       // findEntry 拿最新 entry 再查（新 fiber 已挂 entry.fiber，await 已完成）。
       const freshEntry = findEntry(args.packageName)
       const after = freshEntry ? await waitFiberStable(freshEntry) : '（未找到）'
-      return result + '\n--- 重载前后状态 ---\nbefore: [' + before + ']\nafter: [' + after + ']'
+      const bg = bgOps.get(args.packageName!)
+      const bgLine = bg && String(result).startsWith('WARN')
+        ? `\n- 后台操作：[${bg.state}] ${bg.detail}`
+        : ''
+      return result + bgLine + '\n--- 重载前后状态 ---\nbefore: [' + before + ']\nafter: [' + after + ']'
     },
   }))
 
@@ -2678,10 +3291,13 @@ export function apply(ctx: AppContext, config: Config): void {
       schema: { type: 'string' },
       render: (_args: unknown, value: unknown) => [{ type: 'text', text: String(value) }],
     },
-    async execute(args) {
+    async execute(args: { dir: string; profile?: string }) {
       return withOpLock(async () => {
       const dir = String(args.dir)
-      const profileName = args.profile ? String(args.profile) : 'web'
+      // ⚠️ 缺省 profile 名必须取**当前 profile**（缺陷 A 同族，2026-10-15 修）：
+      // 旧实现写死 'web'，在 desktop profile 下会把包装进另一个 profile
+      // ⇒ 当前进程永远看不到（正是 dev_inject_plugin 报 host ✗ 的同一根因）。
+      const profileName = args.profile ? String(args.profile) : currentProfileName()
       try {
         const pkgPath = join(dir, 'package.json')
         if (!existsSync(pkgPath)) return 'ERROR: 目录无 package.json: ' + dir
@@ -2749,10 +3365,231 @@ export function apply(ctx: AppContext, config: Config): void {
   // ═══════════════════════════════════════════════════════════════════
   // A: 插件生产线——scaffold（生成）/ build（构建打包）/ release（发布）
   // ═══════════════════════════════════════════════════════════════════
-  /** DSH checkout 探测（env → 常见路径）。 */
+  /**
+   * 自备隔离 checkout 的路径（注入器私有的构建源）。
+   * 放在 DSH_HOME/super-injector/checkout —— 只由本插件写，外部流程不碰。
+   */
+  function isolatedCheckoutDir(): string {
+    return join(dshHome, 'super-injector', 'checkout')
+  }
+
+  /** 隔离 checkout 是否可用（关键路径齐全，含构建必需的 @types/node 与 loader）。 */
+  function isolatedCheckoutReady(dir = isolatedCheckoutDir()): boolean {
+    const need = [
+      'packages/core/tools/package.json',
+      'vendor/cordis/package.json',
+      'vendor/cosmokit/package.json',
+      'vendor/schemastery/package.json',
+      // ⚠️ @types/node 必须**带 index.d.ts** 才算就绪：判「目录存在」会放过
+      // 应用自带的那种 2 项存根（无 index.d.ts），构建照样 TS2688（实测踩坑）。
+      'node_modules/@types/node/index.d.ts',
+      // build.sh 会链接 vendor/loader（src import 了 cordis-plugin-loader）
+      'vendor/loader/package.json',
+    ]
+    for (const rel of need) {
+      try { if (!existsSync(join(dir, rel))) return false }
+      catch { return false }
+    }
+    // tsc：允许 .cmd（Windows）或裸文件
+    const bin = join(dir, 'node_modules', '.bin')
+    try {
+      const entries = readdirSync(bin)
+      if (!entries.some((f) => /^tsc(\.cmd|\.ps1)?$/.test(f))) return false
+    }
+    catch { return false }
+    return true
+  }
+
+  /**
+   * 自备隔离 checkout：从**正在运行的 DSH 应用**取包（版本天然匹配），
+   * 加上编译器，组装成一份只被本插件使用的构建源。
+   *
+   * 为什么需要它（2026-10-15 事故链）：
+   *  历史实现复用 `~/dsh-harness` 作为构建源，但那是**共享目录**——别的
+   *  流程（含本插件早期的 junction 物化）会把它掏空，导致自检/构建随机失败
+   *  且原因极难定位（表现为 TS2688/TS2307）。改为自备私有 checkout 后：
+   *  - 版本与运行中的应用一致 ⇒ 类型/导出永不漂移；
+   *  - 只有本插件写它 ⇒ 不再被别的流程破坏；
+   *  - 破坏后可由本函数一键重建（selfHeal 会调用）。
+   *
+   * @returns 就绪的隔离 checkout 路径，或 ''（源不可用/复制失败）
+   */
+  function provisionIsolatedCheckout(): string {
+    const dst = isolatedCheckoutDir()
+    // 定位 DSH 应用自带的 @deepseek-ai 包目录（运行中进程的 ESM 入口就在其中）
+    let appPkgs = ''
+    try {
+      // ctx.baseUrl 指向插件自身的 junction（profile/node_modules/...）
+      // 应用包目录则可由任一已加载包反查；这里用常见安装路径 + 反查兜底。
+      const guesses: string[] = []
+      // 反查：从本插件当前入口向上找到 node_modules/@deepseek-ai
+      try {
+        const selfEntry = fileURLToPath(import.meta.url)
+        let cur = dirname(selfEntry)
+        for (let i = 0; i < 12; i++) {
+          const marker = join(cur, 'node_modules', '@deepseek-ai', 'dsh-tools', 'package.json')
+          if (existsSync(marker)) { guesses.push(join(cur, 'node_modules', '@deepseek-ai')); break }
+          const parent = dirname(cur)
+          if (parent === cur) break
+          cur = parent
+        }
+      }
+      catch { /* 反查失败 */ }
+      // 常见安装路径
+      guesses.push(
+        'D:/app/DSH Desktop/resources/app/node_modules/@deepseek-ai',
+        'C:/Program Files/DSH Desktop/resources/app/node_modules/@deepseek-ai',
+      )
+      for (const g of guesses) {
+        if (existsSync(join(g, 'dsh-tools', 'package.json'))) { appPkgs = g; break }
+      }
+    }
+    catch { /* 定位失败 */ }
+    if (!appPkgs) {
+      logger.warn('[super-injector] 无法定位 DSH 应用包目录 —— 自备 checkout 跳过')
+      return ''
+    }
+
+    /** 递归复制（跳过嵌套 node_modules）。 */
+    const copyTree = (src: string, target: string): void => {
+      mkdirSync(target, { recursive: true })
+      let ents: string[]
+      try { ents = readdirSync(src) } catch { return }
+      for (const name of ents) {
+        if (name === 'node_modules') continue
+        const s = join(src, name)
+        const d = join(target, name)
+        let st
+        try { st = statSync(s) } catch { continue }
+        if (st.isDirectory()) copyTree(s, d)
+        else { try { copyFileSync(s, d) } catch { /* 单个文件失败不阻塞 */ } }
+      }
+    }
+
+    try {
+      const pairs: [string, string][] = [
+        ['cordis', 'vendor/cordis'],
+        ['cosmokit', 'vendor/cosmokit'],
+        ['schemastery', 'vendor/schemastery'],
+        ['dsh-tools', 'packages/core/tools'],
+        ['dsh-llm', 'packages/llm/llm'],
+        ['dsh-system-prompt', 'packages/core/system-prompt'],
+        ['cordis-plugin-loader', 'vendor/loader'],
+        // 完整镜像（类型解析需要：dsh-tools 的 declare module 依赖 dsh-scope/llm/agent/session）
+        ['', 'node_modules/@deepseek-ai'],
+      ]
+      // 先清空目标（只清本插件私有目录）
+      for (const rel of ['vendor', 'packages', 'node_modules/@deepseek-ai']) {
+        try { rmSync(join(dst, rel), { recursive: true, force: true }) } catch { /* 忽略 */ }
+      }
+      for (const [pkg, rel] of pairs) {
+        const src = pkg === '' ? appPkgs : join(appPkgs, pkg)
+        if (!existsSync(src)) { logger.warn('[super-injector] 自备 checkout 缺源: %s', src); continue }
+        copyTree(src, join(dst, rel))
+      }
+      // 编译器等：从当前进程所用 node 的同级 node_modules 找，或复用已有
+      const tsSrcCandidates = [
+        join(appPkgs, '..', 'typescript'),
+        join(appPkgs, '..', '..', 'typescript'),
+      ]
+      for (const ts of tsSrcCandidates) {
+        if (!existsSync(join(ts, 'package.json'))) continue
+        copyTree(ts, join(dst, 'node_modules', 'typescript'))
+        const binSrc = join(ts, '..', '.bin')
+        const binDst = join(dst, 'node_modules', '.bin')
+        mkdirSync(binDst, { recursive: true })
+        try {
+          for (const f of readdirSync(binSrc)) {
+            if (/^tsc(\.cmd|\.ps1)?$/.test(f)) {
+              try { copyFileSync(join(binSrc, f), join(binDst, f)) } catch { /* 忽略 */ }
+            }
+          }
+        }
+        catch { /* 忽略 */ }
+        break
+      }
+      // ★ @types/node：构建必需（tsconfig types:["node"]，缺它 TS2688 直接编不动）。
+      // ⚠️ 实测踩坑（2026-10-15）：**应用的 @types/node 只是个 2 项存根、没有
+      // index.d.ts**，不能当源。所以按优先级找「真正带 index.d.ts」的副本，
+      // 全部找不到才从 npm 拉（离线/受限环境最后手段）。
+      {
+        const typesDst = join(dst, 'node_modules', '@types', 'node')
+        const hasIndex = (d: string): boolean => {
+          try { return existsSync(join(d, 'index.d.ts')) } catch { return false }
+        }
+        const typesCandidates = [
+          // 1) 隔离 checkout 自己已有的（上次就绪副本，最快、零网络）
+          typesDst,
+          // 2) 兜底 checkout（共享的 ~/dsh-harness，通常有）
+          join(homedir(), 'dsh-harness', 'node_modules', '@types', 'node'),
+          // 3) 工具链 checkout（旧机器常见）
+          join(homedir(), 'dsh', 'node_modules', '@types', 'node'),
+          join(homedir(), '.dsh', 'dsh-harness', 'node_modules', '@types', 'node'),
+        ]
+        let typesSrc = ''
+        for (const c of typesCandidates) {
+          if (hasIndex(c) && c !== typesDst) { typesSrc = c; break }
+        }
+        if (typesSrc) {
+          copyTree(typesSrc, typesDst)
+        }
+        else if (!hasIndex(typesDst)) {
+          // 4) 都没有 ⇒ npm pack（需要网络；失败则明确告警而不是静默残缺）
+          try {
+            const tmp = join(dst, '.tmp-types')
+            mkdirSync(tmp, { recursive: true })
+            const res = runCmd('npm', ['pack', '@types/node@22.20.0', '--pack-destination', '.'], tmp)
+            const tgz = res && existsSync(tmp) ? readdirSync(tmp).find((f) => f.endsWith('.tgz')) : undefined
+            if (tgz) {
+              // 用 tar 解包（Windows 10+ 自带 bsdtar）
+              runCmd('tar', ['-xzf', join(tmp, tgz), '-C', tmp, '--strip-components=1'], tmp)
+              const extracted = join(tmp, 'package')
+              if (hasIndex(extracted)) copyTree(extracted, typesDst)
+              else if (hasIndex(tmp)) copyTree(tmp, typesDst)
+            }
+            try { rmSync(tmp, { recursive: true, force: true }) } catch { /* 忽略 */ }
+          }
+          catch { /* 忽略，下方统一告警 */ }
+        }
+        if (!hasIndex(typesDst)) {
+          logger.warn('[super-injector] 自备 checkout 缺 @types/node（来源均不可用）——构建会报 TS2688。'
+            + '可手动放置：%s', typesDst)
+        }
+      }
+      // 最小 package.json（build.sh 的 guard 需要 packages 目录）
+      mkdirSync(join(dst, 'packages', 'core'), { recursive: true })
+      try {
+        writeFileSync(join(dst, 'package.json'), JSON.stringify({
+          name: 'dsh-injector-checkout', private: true, version: '0.0.0',
+          description: 'isolated build checkout provisioned by dsh-super-injector (private; never shared)',
+        }, null, 2) + '\n', 'utf8')
+      }
+      catch { /* 忽略 */ }
+      if (isolatedCheckoutReady(dst)) {
+        logger.info('[super-injector] 自备隔离 checkout 就绪: %s', dst)
+        return dst
+      }
+      logger.warn('[super-injector] 自备隔离 checkout 不完整（缺 tsc 或 @types/node）: %s', dst)
+      return ''
+    }
+    catch (e) {
+      logger.warn('[super-injector] 自备隔离 checkout 失败: %s', String(e))
+      return ''
+    }
+  }
+
+  /** DSH checkout 探测（env → 自备隔离 checkout → 常见路径）。 */
   function detectCheckout(): string {
     const env = (process.env as Record<string, string | undefined>).DSH_CHECKOUT
     if (env && existsSync(join(env, 'packages'))) return env
+    // ★ 优先自备隔离 checkout：只由本插件写、版本对齐运行中的应用、
+    //   被破坏可一键重建（provisionIsolatedCheckout）。共享的 ~/dsh-harness
+    //   曾因被外部流程掏空而导致构建随机失败（2026-10-15 事故）。
+    const iso = isolatedCheckoutDir()
+    if (isolatedCheckoutReady(iso)) return iso
+    // 自备缺失 ⇒ 现场组装一次（首次使用/被清空时）
+    const provisioned = provisionIsolatedCheckout()
+    if (provisioned) return provisioned
     const candidates = [
       join(homedir(), 'dsh-harness'),
       join(homedir(), 'dsh'),
@@ -3032,6 +3869,32 @@ export function apply(ctx: AppContext, config: Config): void {
       const TEST_PKG = '@dsh-external/selftest-runner'
       const TEST_SHORT = 'selftest-runner'
       const tmpDir = join(dshHome, 'super-injector', TEST_SHORT)
+      // ⚠️ 清理 tmpDir 前先把里面可能的链接（历史版本的 junction 残留）拆掉，
+      // 再整体删。原因：本目录若含 junction，递归删除在 Windows + Node 上可能
+      // 跟随链接删空**目标**（实测两组 checkout 的同一批 link 目标全被掏空）。
+      // 现在的 build.sh 已改用 copy 物化依赖，不再产生 junction；这里保留
+      // 拆链兜底，兼容旧版本残留 + 防未来回归。
+      try {
+        const nm = join(tmpDir, 'node_modules')
+        const stripLinks = (dir: string, depth = 0): void => {
+          if (depth > 6) return
+          let ents: string[] = []
+          try { ents = readdirSync(dir) } catch { return }
+          for (const name of ents) {
+            const p = join(dir, name)
+            let isLink = false
+            try { isLink = lstatSync(p).isSymbolicLink() } catch { continue }
+            if (isLink) {
+              try { rmdirSync(p) } catch { /* 忽略 */ }
+            }
+            else {
+              try { if (statSync(p).isDirectory()) stripLinks(p, depth + 1) } catch { /* 忽略 */ }
+            }
+          }
+        }
+        stripLinks(nm)
+      }
+      catch { /* 忽略 */ }
       try { rmSync(tmpDir, { recursive: true, force: true }) } catch { /* 忽略 */ }
       mkdirSync(tmpDir, { recursive: true })
       try {
@@ -3041,13 +3904,13 @@ export function apply(ctx: AppContext, config: Config): void {
         writeFileSync(join(tmpDir, 'package.json'), JSON.stringify({
           name: TEST_PKG, version: '0.0.1', private: true, type: 'module',
           main: './lib/index.js', files: ['lib'], license: 'BSD-3-Clause',
-          peerDependencies: { '@deepseek-ai/dsh-tools': '>=0.0.1-rc <2', 'cordis': '>=4.0.0-rc <5' },
+          peerDependencies: { '@deepseek-ai/dsh-tools': '>=0.0.1-rc <2', '@deepseek-ai/cordis': '>=4.0.0-rc <5' },
           devDependencies: { '@types/node': '^24.13.3', typescript: '^5.9.0' },
           scripts: { build: 'bash scripts/build.sh' },
         }, null, 2) + '\n', 'utf8')
         writeFileSync(join(tmpDir, 'tsconfig.json'), '{\n  "compilerOptions": {\n    "target": "ES2023", "module": "NodeNext", "moduleResolution": "NodeNext", "lib": ["ES2023"],\n    "strict": true, "types": ["node"], "declaration": true, "declarationDir": "lib/types",\n    "outDir": "lib", "rootDir": "src", "skipLibCheck": true, "esModuleInterop": true,\n    "sourceMap": true\n  },\n  "include": ["src"]\n}\n', 'utf8')
         writeFileSync(join(tmpDir, 'src', 'index.ts'), `import type { Context } from '@deepseek-ai/cordis'\nimport { defineTool } from '@deepseek-ai/dsh-tools'\nexport const name = ${JSON.stringify(TEST_PKG)}\nexport const inject = ['tools']\nexport function apply(ctx: Context): void {\n  ctx.effect(() => ctx.tools.register(defineTool({\n    name: 'self_test_hello',\n    description: 'self test',\n    parameters: {},\n    output: { schema: { type: 'string' }, render: (_a: unknown, v: unknown) => [{ type: 'text', text: String(v) }] },\n    async execute() { return 'hello' },\n  })), 'self-test')\n}\n`, 'utf8')
-        writeFileSync(join(tmpDir, 'scripts', 'build.sh'), `#!/bin/bash\nset -euo pipefail\nROOT="$(cd "$(dirname "$0")/.." && pwd)"\ncd "$ROOT"\nCHECKOUT="\${DSH_CHECKOUT:-}"\nif [ -z "$CHECKOUT" ] || [ ! -d "$CHECKOUT/packages" ]; then echo "no checkout" >&2; exit 1; fi\nTSC="$CHECKOUT/node_modules/.bin/tsc"\nlink_pkg() {\n  node -e "const fs=require('fs');const path=require('path');const l=path.resolve(process.argv[1]);const t=path.resolve(process.argv[2]);fs.rmSync(l,{recursive:true,force:true});fs.mkdirSync(path.dirname(l),{recursive:true});fs.symlinkSync(t,l,process.platform==='win32'?'junction':'dir');" "node_modules/$1" "$2"\n}\nmkdir -p node_modules/@deepseek-ai\nnode -e "const fs=require('fs');fs.rmSync('node_modules/@standard-schema',{recursive:true,force:true})"\nlink_pkg @deepseek-ai/cordis "$CHECKOUT/vendor/cordis"\nlink_pkg @deepseek-ai/cosmokit "$CHECKOUT/vendor/cosmokit"\nlink_pkg @deepseek-ai/schemastery "$CHECKOUT/vendor/schemastery"\nlink_pkg @deepseek-ai/dsh-tools "$CHECKOUT/packages/core/tools"\nlink_pkg @types/node "$CHECKOUT/node_modules/@types/node"\n"$TSC" -p tsconfig.json\n`, 'utf8')
+        writeFileSync(join(tmpDir, 'scripts', 'build.sh'), `#!/bin/bash\nset -euo pipefail\nROOT="$(cd "$(dirname "$0")/.." && pwd)"\ncd "$ROOT"\nCHECKOUT="\${DSH_CHECKOUT:-}"\nif [ -z "$CHECKOUT" ] || [ ! -d "$CHECKOUT/packages" ]; then echo "no checkout" >&2; exit 1; fi\nTSC="$CHECKOUT/node_modules/.bin/tsc"\n# 依赖物化用 copy，绝不用 junction：本目录是一次性构建目录，整体递归删除时\n# junction 会让 Windows/Node 跟随链接删空**目标**（实测两组 checkout 的同一批\n# link 目标全被掏空）。copy 后源只在读取侧被访问，物理上不可能被写坏。\nuse_pkg() {\n  node -e "const fs=require('fs');const path=require('path');const dst=path.resolve(process.argv[1]);const src=path.resolve(process.argv[2]);try{const st=fs.lstatSync(dst);if(st.isSymbolicLink())fs.rmdirSync(dst);else fs.rmSync(dst,{recursive:true,force:true});}catch{};fs.mkdirSync(path.dirname(dst),{recursive:true});fs.cpSync(src,dst,{recursive:true,dereference:false,filter:(s)=>path.basename(s)!=='node_modules'});" "node_modules/$1" "$2"\n}\nlink_pkg() { use_pkg "$@"; }\nmkdir -p node_modules/@deepseek-ai\nnode -e "const fs=require('fs');try{const s=fs.lstatSync('node_modules/@standard-schema');if(s.isSymbolicLink())fs.rmdirSync('node_modules/@standard-schema');else fs.rmSync('node_modules/@standard-schema',{recursive:true,force:true});}catch{}"\nlink_pkg @deepseek-ai/cordis "$CHECKOUT/vendor/cordis"\nlink_pkg cosmokit "$CHECKOUT/vendor/cosmokit"\nlink_pkg @deepseek-ai/schemastery "$CHECKOUT/vendor/schemastery"\nlink_pkg @deepseek-ai/dsh-tools "$CHECKOUT/packages/core/tools"\nlink_pkg @types/node "$CHECKOUT/node_modules/@types/node"\n"$TSC" -p tsconfig.json\n`, 'utf8')
         const checkout = detectCheckout()
         if (!checkout) { check('checkout 探测', false, '无 DSH_CHECKOUT'); return summarize(results) }
         // ── 2. 构建测试插件 ──
@@ -3126,7 +3989,18 @@ export function apply(ctx: AppContext, config: Config): void {
             const backup = readFileSync(libPath, 'utf8')
             writeFileSync(libPath, 'BROKEN SELF TEST !!!', 'utf8')
             const precheck = await withOpLock(() => reloadPackage('dsh-super-injector'))
-            check('预检拦截（拒绝自杀）', precheck.includes('预检失败'), precheck.slice(0, 150))
+            // ⚠️ 判定要接受两种**都安全**的结果（实测踩坑，2026-10-15）：
+            //   ① 正常路径：loader.internal 可用 ⇒ 预检读到损坏文件 ⇒ 「预检失败」
+            //      （主动拒绝自杀）。
+            //   ② 降级路径：宿主未开 --expose-internals ⇒ loader.internal 恒
+            //      undefined ⇒ reloadPackage 走 cache-busting 降级；此时代码若
+            //      语法损坏，import 直接抛错（INFO: 缓存中无匹配且磁盘降级失败）。
+            // 两者都**没有**让损坏代码生效（不会自杀），因此都算拦截成功；只把
+            // 「预检失败」当唯一通过条件会让该用例在正常环境下永久红（假失败）。
+            const blocked = precheck.includes('预检失败')
+              || precheck.includes('降级失败')
+              || precheck.includes('ERROR')
+            check('预检拦截（拒绝自杀）', blocked, precheck.slice(0, 180))
             writeFileSync(libPath, backup, 'utf8')
             libRestored = true
           } catch (e) {
@@ -3167,7 +4041,7 @@ export function apply(ctx: AppContext, config: Config): void {
         // 仅清理可能残留的 junction（卸载路径已处理，这里兜底）
         try {
           const linkDir = join(profileNodeModules, '@dsh-external', TEST_SHORT)
-          if (existsSync(linkDir)) rmSync(linkDir, { recursive: true, force: true })
+          if (existsSync(linkDir)) removeLinkOnly(linkDir)
         } catch { /* 忽略 */ }
       }
       return summarize(results)

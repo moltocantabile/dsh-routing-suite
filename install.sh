@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # dsh-routing-suite 一键安装（Linux/macOS；镜像 install.ps1）：装配注入器 + 安装预设 + 自检。
-# 注入器装配：优先源码构建（npm prepare），失败自动回退官方 Release tgz（SUPER_INJECTOR_VERSION 覆盖版本，默认 0.3.3）。
+# 注入器装配：优先源码构建（npm prepare），失败自动回退官方 Release tgz（SUPER_INJECTOR_VERSION 覆盖版本，默认 0.3.5）。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -45,7 +45,7 @@ if [ ! -f "$PKG_DIR/lib/index.js" ]; then
     ok 'injector/lib 构建完成'
   else
     # 源码构建依赖私有 @deepseek-ai peer 包（package-lock 锁定），公共 npm registry 404 → 回退官方 Release tgz
-    SPI_VERSION="${SUPER_INJECTOR_VERSION:-0.3.3}"
+    SPI_VERSION="${SUPER_INJECTOR_VERSION:-0.3.5}"
     SPI_DIST_DIR="$DSH_HOME/external/dsh-super-injector"
     SPI_TGZ="https://github.com/yjh051108/dsh-super-injector/releases/download/v${SPI_VERSION}/dsh-external-dsh-super-injector-${SPI_VERSION}.tgz"
     if [ ! -f "$SPI_DIST_DIR/lib/index.js" ]; then

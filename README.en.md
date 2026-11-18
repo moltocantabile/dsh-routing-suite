@@ -23,44 +23,73 @@ speced plan → check-in → group close-out → final check, with redteam gate 
 | **preset** | Reasoning-mode routing presets (router-standard / router-spec, persona-based routing) | [preset/README.md](preset/README.md) · [experiments](preset/docs/experiments.md) |
 | **graded** | Graded mode: session-level two-level task protocol (6 tools + 3 modes + per-item mode + redteam gate + audit endpoint + super panel) | [graded/README.md](graded/README.md) · [ARCHITECTURE](graded/docs/ARCHITECTURE.md) · [THEORY](graded/docs/THEORY.md) · [DATA](graded/docs/DATA.md) |
 
+## Install
+
+**Option A (recommended): clone + one-shot installer** (injector assembly + preset copy + layout self-check)
+
+```bash
+git clone https://github.com/yjh051108/dsh-routing-suite.git
+cd dsh-routing-suite
+
+bash install.sh        # macOS / Linux
+.\install.ps1          # Windows (PowerShell)
+```
+
+**Option B: bundle only** (injector; no router presets)
+
+```bash
+dsh plugin --profile web add github:yjh051108/dsh-routing-suite
+```
+
+> This suite bundles all three components (`injector/`, `preset/` and `graded/`
+> are ordinary directories committed directly); the graded release artifact is
+> `graded/dsh-external-dsh-graded-mode-0.0.1-rc1.tgz` (or the Release asset).
+
+**DSH Target**: `>=0.1.0-rc.6` (followed rc.8 / 0.1.1-rc.2 / 0.1.2-alpha.1, and
+verified + compat-fixed on **0.2.1-rc.2** — see [docs/COMPAT.md](docs/COMPAT.md))
+
+> DSH is in developer preview and officially ships breaking changes. Follow-up
+> records live in `preset/CHANGELOG.md` and [docs/COMPAT.md](docs/COMPAT.md).
+
 ## Install chain (three steps)
 
-```powershell
+```bash
 # 1. Clone the suite (single repo: injector/preset content is stored directly, no submodules)
 git clone https://github.com/yjh051108/dsh-routing-suite.git
 cd dsh-routing-suite
 
 # 2. One-shot install (injector assembly + preset copy + layout self-check + restart prompt)
-.\install.ps1
+bash install.sh        # macOS / Linux
+.\install.ps1          # Windows (PowerShell)
 ```
 
-Or manually:
+Or manually (macOS/Linux uses `~/.dsh`; on Windows replace `~` with
+`$env:USERPROFILE` and `/` with `\`):
 
-```powershell
+```bash
 # Step 1: assemble the injector (official assembly; bundles take over after restart)
-dsh plugin --profile web add .\injector
-# If dsh is not on PATH (npx @deepseek-ai/dsh web): npx '@deepseek-ai/dsh' plugin --profile web add .\injector
+dsh plugin --profile web add ./injector
+# If dsh is not on PATH (npx @deepseek-ai/dsh web): npx '@deepseek-ai/dsh' plugin --profile web add ./injector
 
 # Step 2: install the router presets (one or both; DSH scans one level only,
 # so each preset directory must sit FLAT under .agent-presets)
-$target = Join-Path $env:USERPROFILE '.dsh\.agent-presets\router-standard'
-Copy-Item -Recurse .\preset\router-standard $target
-
-$target = Join-Path $env:USERPROFILE '.dsh\.agent-presets\router-spec'
-Copy-Item -Recurse .\preset\router-spec $target
+mkdir -p ~/.dsh/.agent-presets
+cp -R preset/router-standard ~/.dsh/.agent-presets/router-standard
+cp -R preset/router-spec ~/.dsh/.agent-presets/router-spec
 
 # Step 3: restart DSH → pick Router Standard / Router Spec in a new session
 ```
 
 > Do NOT copy the `preset` directory as a whole — the extra nesting hides the
-> presets from DSH discovery.
+> presets from DSH discovery. Known macOS/Linux compatibility points and how to
+> verify them: [docs/COMPAT.md](docs/COMPAT.md).
 
 ## Components
 
 | Path | Repo | Version | Role |
 |---|---|---|---|
-| `injector/` | [dsh-super-injector](https://github.com/yjh051108/dsh-super-injector) | [v0.3.3](https://github.com/yjh051108/dsh-super-injector/releases/tag/v0.3.3) | Runtime injector: dev_* tool family (inject / hot-reload / staging-promote / uninject / route self-heal); git installs build automatically (prepare hook) |
-| `preset/` | [dsh-router-standard](https://github.com/yjh051108/dsh-router-standard) | [v0.3.0 … mainline v1.19.1/v34](https://github.com/yjh051108/dsh-router-standard/releases/tag/v0.3.0) | Reasoning-mode routing presets: router-standard (classified persona + full sections) / router-spec (deep-think-first). router-pro is planned but NOT part of v0.3.0 |
+| `injector/` | [dsh-super-injector](https://github.com/yjh051108/dsh-super-injector) | mainline v0.3.6 (latest Release [v0.3.5](https://github.com/yjh051108/dsh-super-injector/releases/tag/v0.3.5)) | Runtime injector: dev_* tool family (inject / hot-reload / staging-promote / uninject / route self-heal); git installs build automatically (prepare hook); 0.3.6 fixes DSH 0.2.x profile derivation + missing `loader.internal` |
+| `preset/` | [dsh-router-standard](https://github.com/yjh051108/dsh-router-standard) | [v0.3.0 … mainline v1.27/v34](https://github.com/yjh051108/dsh-router-standard/releases/tag/v0.3.0) | Reasoning-mode routing presets: router-standard (classified persona + full sections) / router-spec (deep-think-first). router-pro is planned but NOT part of v0.3.0 |
 | `graded/` | [dsh-graded-mode](https://github.com/yjh051108/dsh-routing-suite/tree/main/graded) | [v3.2.0](https://github.com/yjh051108/dsh-routing-suite/releases) | Graded mode: session-level two-level task protocol (brainstorm quiz alignment → North-Star finalization → speced plan → spec-driven injection → check-in → group close-out → final check); 6 tools + 3 modes + per-item mode + redteam gate + audit endpoint; `graded/dsh-graded-mode-3.2.0.tgz` is a direct `dsh plugin --profile web add` target |
 
 > Versions follow each component repo's git tag (links go to the matching Release).
@@ -90,6 +119,8 @@ directory is `preset/router-standard` (flat, no extra nesting).
 
 - Injector guide (10 rules): `injector/README.md`
 - Routing preset paper & experiments: `preset/docs/paper.md` + `preset/docs/experiments.md` (P1–P23)
+- Repository structure migration (submodules → plain files): [docs/FLATTEN-MIGRATION.md](docs/FLATTEN-MIGRATION.md)
+- DSH version compatibility (0.2.1-rc.2) and macOS notes: [docs/COMPAT.md](docs/COMPAT.md)
 
 ## License
 

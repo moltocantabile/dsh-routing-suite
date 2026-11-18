@@ -1,4 +1,0 @@
-# npm otherwise reuses .gitignore and drops the lib/ output built by prepare.
-node_modules/
-*.tsbuildinfo
-*.tgz
