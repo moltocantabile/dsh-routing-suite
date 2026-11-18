@@ -11,6 +11,15 @@
 
 ### 修复
 
+- **设置页「插件」空白（DSH 0.2.1 UI 契约，实机定位）**：`settings.section` 的
+  `component` 在 0.2.1 必须是 **React 组件**——shell（ui-settings-general）经 renderSlot
+  用 `jsx(Comp, props)` 挂载（renderer 无任何旧形态兼容分支）。旧实现 `component: () =>
+  ({ render() {...} })` 是 0.1.x 实例工厂形态：React 调用后得到纯对象 →
+  "Objects are not valid as a React child" → 页面空白。已重写
+  `src/client/index.ts` 为 React FC（`useState/useEffect/useRef`，无 JSX），注册改
+  官方双参形态 `ctx.slots.register({...}, Component)`，功能不变（列表/加载统计/卸载/
+  路径注入/内化/拖放提示/60s 轮询）。验证：ModuleLoader 包装下 bundle 求值 +
+  react-dom/server `renderToString` 输出 2319B 有效 HTML（含全部 UI 文案）。
 - **POSIX symlink 删除（macOS/Linux 硬 bug）**：删 profile 链接 / 链接自愈 / 构建物化 / stripLinks
   处一律 `rmdirSync`。Windows junction 是目录语义可行，POSIX symlink 会 `ENOTDIR` ⇒
   卸载删不掉链接、自愈重建报 `EEXIST`、构建报 `ERR_FS_CP_EINVAL`。改为
